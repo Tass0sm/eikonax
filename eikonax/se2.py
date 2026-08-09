@@ -1,165 +1,170 @@
-"""Single-source anisotropic eikonal equation on R^2 x S^1 -- see this
-package's README.org for the mathematical background (the metric, why
-value iteration rather than a finite-difference Hamiltonian stencil).
-
-State space: `(x, y, theta)`, `theta` periodic. Local cost of moving in a
-world-frame direction `phi` off the CURRENT heading `theta`:
-
-    speed(phi) = sqrt(cos(phi)^2 + xi^2 * sin(phi)^2)   -- 1 when phi=0
-                                                            (straight ahead),
-                                                            xi when phi=+-90
-                                                            deg (sideways)
-    speed(turn) = xi                                    -- same ratio for
-                                                            pure rotation
-
-`xi` in (0, 1]; `xi = 1` is isotropic (uniform speed regardless of facing).
-
-Solved via value iteration (Jacobi-style Bellman fixed point): every node's
-arrival time is repeatedly relaxed to the minimum, over two disjoint
-candidate-move families, of "move cost + interpolated arrival time at the
-move's target" (see `Solver.solve`'s own docstring for the exact update).
-Starts from a large sentinel everywhere except the source (pinned at 0) and
-decreases monotonically to the converged field.
+"""SE(2) (R^2 x S^1) application of the general `eikonax.fsm` solver: builds
+the grid/periodicity/metric-field plumbing `fsm.Solver` needs for a
+"unicycle-ish" `(x, y, theta)` state space, plus a convenience metric-matrix
+builder for the standard "soft preference for moving/turning toward the
+current heading" model. ANY metric matrix can be substituted (`build_solver`'s
+`metric_at_theta` argument) -- including one with genuine
+translation-rotation coupling that this default, purely-diagonal
+`xi_lateral`/`xi_turn` matrix cannot express. See `fsm.py`'s own module
+docstring for why that coupling matters: with only "translate-only" and
+"rotate-only" candidate moves (this package's own earlier design), no
+metric choice could ever produce a shortest path that actually turns into
+its direction of travel -- `fsm.py`'s combined-offset candidates fix that
+structurally; the metric matrix built here just decides how STRONGLY that
+preference is expressed once it's actually representable.
 """
 
-import jax
+from collections.abc import Callable
+
 import jax.numpy as jnp
 import numpy as np
-from jax.scipy.ndimage import map_coordinates
 
-# Arrival times accumulate over many sweep iterations; JAX's default
-# float32 loses precision fast over that many additions. Same convention
-# goc-mpc's own time_to_go_field.py uses for its gradient-descent tracer.
-jax.config.update("jax_enable_x64", True)
-
-#: Sentinel for both the initial "unknown" value and obstacle-touching
-#: cells (pinned back to this after every sweep). Must be finite -- see
-#: po_goc_mpc.experiments.objectives.fmm.OBSTACLE_FILL's own docstring for
-#: why (linear interpolation against a literal inf poisons any blend with
-#: nonzero weight on an obstacle cell). Same magnitude as that module's
-#: constant, for consistency, though this package has no dependency on it.
-OBSTACLE_FILL = 1.0e4
+from . import fsm
 
 
-class Solver:
-    """A compiled solver for one FIXED `(mask, resolution, n_theta, xi,
-    n_directions)` grid+metric combination -- build once, then call
-    `.solve(source)` for as many different source states as needed without
-    triggering a fresh JIT compilation each time (`source` is a traced
-    argument to the compiled sweep, not baked in at trace time). Use this
-    directly instead of the module-level `solve()` convenience function
-    whenever solving many sources against the same grid -- e.g. building an
-    all-pairs field, which is exactly what a single-source solve baking
-    `source` in at trace time would make prohibitively slow (one full
-    recompilation per source).
+def default_metric_at_theta(thetas: np.ndarray, xi_lateral: float, xi_turn: float) -> np.ndarray:
+    """The "soft preference" metric matrix `G(theta)` at every theta bin:
+    `F(theta, dy, dx, dtheta)^2 = u1^2 + u2^2/xi_lateral^2 +
+    dtheta^2/xi_turn^2`, `(u1, u2)` = `(dy, dx)` resolved into the
+    forward/lateral frame at heading `theta` -- moving along the current
+    heading is unit cost, moving laterally costs `1/xi_lateral`, turning
+    costs `1/xi_turn`, all independently tunable (see this module's own
+    docstring for why they're decoupled, not one shared ratio). Returns
+    shape `(n_theta, 3, 3)`; `xi_lateral`/`xi_turn` both in `(0, 1]`.
+
+    NOTE the `(dy, dx, dtheta)` input order, not `(dx, dy, dtheta)`: this
+    has to match `build_solver`'s `grid_shape = (ny, nx, n_theta)` axis
+    order (axis 0 = y/row, matching `_mask_and_coords`'s own `mask[sy,
+    sx]` convention that the rest of this project's occupancy-grid code
+    already uses), since that's the order `fsm.Solver` indexes physical
+    displacement components in. Getting this backwards is a real bug this
+    module's own dev hit: at `theta=0` exactly, `sin(0)=0` collapses the
+    rotation to the identity matrix EITHER WAY, so a `(dx, dy, dtheta)`-
+    ordered version of this function looks perfectly correct for a
+    `theta=0`-only test and only misattributes forward/lateral for every
+    OTHER heading -- caught by testing at a nonzero heading too.
     """
+    n_theta = len(thetas)
+    d = np.diag([1.0, 1.0 / xi_lateral ** 2, 1.0 / xi_turn ** 2])
+    metric = np.empty((n_theta, 3, 3))
+    for k, theta in enumerate(thetas):
+        c, s = np.cos(theta), np.sin(theta)
+        # u1 (forward) = dx*cos + dy*sin; u2 (lateral) = dy*cos - dx*sin;
+        # u3 = dtheta -- expressed here as a matrix acting on (dy, dx,
+        # dtheta), per the NOTE above.
+        a = np.array([[s, c, 0.0], [c, -s, 0.0], [0.0, 0.0, 1.0]])
+        metric[k] = a.T @ d @ a
+    return metric
 
-    def __init__(
-            self,
-            mask: np.ndarray,
-            resolution: float,
-            n_theta: int,
-            xi: float,
-            n_directions: int = 16,
-            obstacle_fill: float = OBSTACLE_FILL,
-    ):
-        mask = np.asarray(mask, dtype=bool)
-        self.mask = mask
-        self.ny, self.nx = mask.shape
-        self.resolution = resolution
-        self.n_theta = n_theta
-        self.xi = xi
-        self.n_directions = n_directions
-        self.obstacle_fill = obstacle_fill
 
-        thetas = jnp.linspace(0.0, 2.0 * jnp.pi, n_theta, endpoint=False)
-        phis = 2.0 * jnp.pi * jnp.arange(n_directions) / n_directions          # (n_directions,)
-        translate_speed = jnp.sqrt(jnp.cos(phis) ** 2 + (xi ** 2) * jnp.sin(phis) ** 2)
-        translate_cost = resolution / translate_speed                          # (n_directions,)
+def mask_speed_fn(
+        mask: np.ndarray, resolution: float, origin_xy=(0.0, 0.0),
+        obstacle_speed: float = 0.0, free_speed: float = 1.0,
+) -> Callable[[jnp.ndarray], jnp.ndarray]:
+    """Bridges a binary `(ny, nx)` occupancy mask (True = obstacle, e.g.
+    from `po_goc_mpc.experiments.objectives.fmm._mask_and_coords`) into the
+    JAX-jittable `speed_fn(coords) -> speed` `fsm.Solver` wants (see that
+    module's own docstring for why a general speed field replaced a mask
+    parameter there) -- a convenience for the common case, not the only way
+    to build one: pass your own `speed_fn` directly to `build_solver`
+    instead for anything richer (slow terrain, a soft margin around
+    obstacles, ...).
 
-        world_angles = thetas[:, None] + phis[None, :]                         # (n_theta, n_directions)
-        row_offsets = jnp.sin(world_angles)
-        col_offsets = jnp.cos(world_angles)
+    `coords`' theta component (axis -1, index 2) is ignored -- occupancy
+    doesn't depend on heading.
 
-        h_theta = 2.0 * jnp.pi / n_theta
-        rotate_cost = h_theta / xi
+    NOTE `coords[..., 0]` is Y (row) and `coords[..., 1]` is X (col), not
+    the other way around -- matches `build_solver`'s `grid_shape = (ny,
+    nx, n_theta)` axis order (axis 0 = row = y, per `_mask_and_coords`'s
+    own `mask[sy, sx]` convention). Getting this backwards is the same
+    class of bug `default_metric_at_theta`'s own docstring describes.
+    """
+    mask_j = jnp.asarray(mask)
+    ny, nx = mask.shape
+    x0, y0 = origin_xy
 
-        mask_j = jnp.asarray(mask)
-        grid_row, grid_col = jnp.meshgrid(jnp.arange(self.ny), jnp.arange(self.nx), indexing="ij")
+    def speed_fn(coords: jnp.ndarray) -> jnp.ndarray:
+        yi = jnp.clip(jnp.round((coords[..., 0] - y0) / resolution).astype(jnp.int32), 0, ny - 1)
+        xi = jnp.clip(jnp.round((coords[..., 1] - x0) / resolution).astype(jnp.int32), 0, nx - 1)
+        occupied = mask_j[yi, xi]
+        return jnp.where(occupied, obstacle_speed, free_speed)
 
-        def translate_candidate(u_layer: jnp.ndarray, k: int, m: int) -> jnp.ndarray:
-            target_row = grid_row + row_offsets[k, m]
-            target_col = grid_col + col_offsets[k, m]
-            coords = jnp.stack([target_row.ravel(), target_col.ravel()])
-            # mode="nearest": a translate step off the grid edge clamps to
-            # the boundary value instead of wrapping (xy is NOT periodic,
-            # unlike theta) -- same convention fmm.make_fmm_edge_cost_fn
-            # uses.
-            interp = map_coordinates(u_layer, coords, order=1, mode="nearest")
-            return interp.reshape(self.ny, self.nx) + translate_cost[m]
+    return speed_fn
 
-        def sweep(u: jnp.ndarray, source: jnp.ndarray) -> jnp.ndarray:
-            layers = []
-            for k in range(n_theta):
-                u_layer_k = u[:, :, k]
-                cand = u_layer_k
-                for m in range(n_directions):
-                    cand = jnp.minimum(cand, translate_candidate(u_layer_k, k, m))
-                # Rotate candidates: exact grid lookup (theta already
-                # discrete), periodic wrap via modular indexing.
-                cand = jnp.minimum(cand, u[:, :, (k + 1) % n_theta] + rotate_cost)
-                cand = jnp.minimum(cand, u[:, :, (k - 1) % n_theta] + rotate_cost)
-                layers.append(cand)
-            new_u = jnp.stack(layers, axis=2)
-            new_u = jnp.where(mask_j[:, :, None], obstacle_fill, new_u)
-            return new_u.at[source[0], source[1], source[2]].set(0.0)
 
-        self._sweep = jax.jit(sweep)
+def build_solver(
+        ny: int,
+        nx: int,
+        resolution: float,
+        n_theta: int,
+        speed_fn: Callable[[jnp.ndarray], jnp.ndarray],
+        origin_xy=(0.0, 0.0),
+        metric_at_theta: np.ndarray | None = None,
+        xi_lateral: float = 0.4,
+        xi_turn: float = 0.9,
+        radius: int = 2,
+        obstacle_fill: float = fsm.OBSTACLE_FILL,
+) -> tuple[fsm.Solver, np.ndarray]:
+    """Returns `(solver, thetas)`: an `fsm.Solver` over the `(ny, nx,
+    n_theta)` SE(2) grid (x, y non-periodic at `resolution`; theta
+    periodic, `n_theta` evenly-spaced bins), using `metric_at_theta`
+    (defaulting to `default_metric_at_theta(thetas, xi_lateral, xi_turn)`
+    if not given -- pass your own `(n_theta, 3, 3)` array for a fully
+    customized metric) broadcast across every `(x, y)` position (the
+    metric is position-INDEPENDENT here -- only `speed_fn` varies by
+    position; build a position-dependent metric yourself and call
+    `fsm.Solver` directly if you need that).
+    """
+    thetas = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
+    if metric_at_theta is None:
+        metric_at_theta = default_metric_at_theta(thetas, xi_lateral, xi_turn)
+    elif metric_at_theta.shape != (n_theta, 3, 3):
+        raise ValueError(f"metric_at_theta must have shape ({n_theta}, 3, 3), got {metric_at_theta.shape}")
 
-    def solve(self, source: tuple[int, int, int], n_iters: int = 300, tol: float = 1e-5) -> np.ndarray:
-        """Returns `field`, shape `(ny, nx, n_theta)`: `field[i, j, k]` is
-        the arrival time from state `source` (grid indices `(sy, sx, sk)`,
-        NOT physical coordinates -- same convention `skfmm.travel_time`'s
-        own single-point-source `phi` array uses) to state `(x[j], y[i],
-        theta[k])`, `theta[k] = 2*pi*k/n_theta`. See class docstring for
-        why this is cheap to call repeatedly with different `source`s.
-        """
-        sy, sx, sk = source
-        if not (0 <= sy < self.ny and 0 <= sx < self.nx and 0 <= sk < self.n_theta):
-            raise ValueError(f"source {source} out of bounds for grid ({self.ny}, {self.nx}, {self.n_theta})")
-        if self.mask[sy, sx]:
-            raise ValueError(f"source {source} is inside an obstacle cell")
+    metric = np.empty((ny, nx, n_theta, 3, 3))
+    metric[:, :, :] = metric_at_theta[None, None, :, :, :]
 
-        source_arr = jnp.asarray(source, dtype=jnp.int32)
-        u = jnp.full((self.ny, self.nx, self.n_theta), self.obstacle_fill, dtype=jnp.float64)
-        u = u.at[sy, sx, sk].set(0.0)
+    h_theta = 2.0 * np.pi / n_theta
+    resolutions = (resolution, resolution, h_theta)
+    periodic = (False, False, True)
+    origin = (origin_xy[0], origin_xy[1], 0.0)
 
-        for _ in range(n_iters):
-            new_u = self._sweep(u, source_arr)
-            diff = float(jnp.max(jnp.abs(new_u - u)))
-            u = new_u
-            if diff < tol:
-                break
-
-        return np.asarray(u)
+    solver = fsm.Solver(
+        (ny, nx, n_theta), resolutions, periodic, metric, speed_fn,
+        origin=origin, radius=radius, obstacle_fill=obstacle_fill,
+    )
+    return solver, thetas
 
 
 def solve(
-        mask: np.ndarray,
+        ny: int,
+        nx: int,
         resolution: float,
         n_theta: int,
-        xi: float,
+        speed_fn: Callable[[jnp.ndarray], jnp.ndarray],
         source: tuple[int, int, int],
-        n_directions: int = 16,
+        origin_xy=(0.0, 0.0),
+        metric_at_theta: np.ndarray | None = None,
+        xi_lateral: float = 0.4,
+        xi_turn: float = 0.9,
+        radius: int = 2,
         n_iters: int = 300,
         tol: float = 1e-5,
-        obstacle_fill: float = OBSTACLE_FILL,
+        obstacle_fill: float = fsm.OBSTACLE_FILL,
 ) -> np.ndarray:
-    """Convenience wrapper for a single solve -- builds a fresh `Solver`
-    (see its docstring for the args) and calls `.solve(source, n_iters,
-    tol)` on it. Prefer `Solver` directly when solving many sources against
-    the same `(mask, resolution, n_theta, xi, n_directions)` grid -- e.g.
-    an all-pairs field -- to avoid recompiling the sweep once per source.
+    """Convenience wrapper for a single solve -- builds a fresh solver via
+    `build_solver` (see its docstring for the args) and calls
+    `.solve(source, n_iters, tol)` on it. Prefer `build_solver` +
+    `Solver.solve` directly when solving many sources against the same
+    grid/metric/speed field -- e.g. an all-pairs field -- to avoid
+    recompiling the sweep once per source.
+
+    Returns `field`, shape `(ny, nx, n_theta)`: `field[i, j, k]` is the
+    arrival time from state `source` (grid indices `(sy, sx, sk)`) to
+    state `(x[j], y[i], theta[k])`, `theta[k] = 2*pi*k/n_theta`.
     """
-    solver = Solver(mask, resolution, n_theta, xi, n_directions, obstacle_fill)
+    solver, _thetas = build_solver(
+        ny, nx, resolution, n_theta, speed_fn, origin_xy, metric_at_theta,
+        xi_lateral, xi_turn, radius, obstacle_fill,
+    )
     return solver.solve(source, n_iters, tol)

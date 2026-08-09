@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-JAX-based numerical solvers for eikonal and Hamilton-Jacobi-Bellman (HJB) equations on regular grids -- see README.org for the mathematical background and the first solver (`eikonax.se2`, an anisotropic eikonal equation on R^2 x S^1).
+JAX-based numerical solvers for eikonal and Hamilton-Jacobi-Bellman (HJB) equations on regular grids -- see README.org for the mathematical background: a general N-dimensional Fast Sweeping Method (`eikonax.fsm`), and its SE(2) application (`eikonax.se2`, an anisotropic eikonal equation on R^2 x S^1 with a customizable metric matrix).
 
 ## Package Management
 
@@ -18,7 +18,8 @@ poetry run pytest       # run tests
 
 ## Architecture
 
-- `eikonax/se2.py` -- single-source anisotropic eikonal solver over `(x, y, theta)` state space (value iteration / semi-Lagrangian fast sweeping). Plain function of numpy/JAX arrays; no opinion on caching or how a caller builds an all-pairs field from repeated single-source solves.
+- `eikonax/fsm.py` -- general N-dimensional Fast Sweeping Method (value iteration / semi-Lagrangian). Takes a per-node metric matrix and a JAX-jittable speed field (obstacles are just `speed_fn(x) ~ 0`); candidate moves are wide-stencil integer grid offsets that can translate AND rotate (or whatever the axes represent) in a single move -- see its own module docstring for why that matters. No opinion on caching or how a caller builds an all-pairs field from repeated single-source solves.
+- `eikonax/se2.py` -- thin SE(2)-specific layer on top of `fsm.py`: builds the `(ny, nx, n_theta)` grid/periodicity plumbing and a default "soft preference for the current heading" metric, but accepts any custom metric matrix.
 
 ## Downstream consumer
 

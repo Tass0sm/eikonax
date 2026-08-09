@@ -1,13 +1,13 @@
 #+title: eikonax
 
 JAX-based numerical solvers for eikonal and Hamilton-Jacobi-Bellman (HJB)
-equations on regular grids. An eikonal equation |grad u|_F = 1 (arrival-time
-field for a given, possibly anisotropic, cost metric F) is the stationary,
-shortest-time special case of an HJB equation -- both are solved here the
-same way: value iteration over a discretized control set (a semi-Lagrangian
-scheme), which is simple to get right for a genuinely anisotropic/Finsler
-metric (no local finite-difference stencil to derive per equation) and
-vectorizes cleanly on GPU via JAX.
+equations on regular grids. An eikonal equation |grad u|_G = 1 (arrival-time
+field for a given, possibly anisotropic, Riemannian metric G) is the
+stationary, shortest-time special case of an HJB equation -- both are
+solved here the same way: value iteration over a discretized set of
+candidate moves (a semi-Lagrangian scheme), which is simple to get right
+for a genuinely anisotropic metric (no local finite-difference stencil to
+derive per equation) and vectorizes cleanly on GPU via JAX.
 
 * Setup
 
@@ -15,79 +15,159 @@ vectorizes cleanly on GPU via JAX.
 poetry install
 #+end_src
 
-* ~eikonax.se2~: anisotropic eikonal equation on R^2 x S^1
+* ~eikonax.fsm~: general N-dimensional Fast Sweeping Method
 
-Solves a single-source arrival-time field over a "unicycle-ish" state space
-~(x, y, theta)~ -- position plus heading -- where the local cost of moving
-in a given world-frame direction depends on how well it's aligned with the
-CURRENT heading ~theta~: moving straight ahead is cheapest/fastest, moving
-sideways or turning in place is slower, controlled by one anisotropy ratio
-~xi in (0, 1]~ (~xi = 1~ recovers the isotropic case). This is the standard
-"faster in the direction you're facing" model used to make routed paths
-around obstacles prefer smooth, forward-facing motion over strafing --
-originally built for ~po-goc-mpc~'s legged-robot obstacle routing (see that
-project's ~po_goc_mpc.experiments.objectives~ for the all-pairs field
-builder + disk cache + ~edge_cost_fn~ wrapper built on top of this solver).
+The core solver, dimension- and manifold-agnostic. Given:
 
-** The metric
+  - a grid shape, per-axis physical resolution, and per-axis periodicity
+    (so e.g. an angular axis can wrap while a translation axis doesn't),
+  - a Riemannian metric matrix ~G~ at every grid node (`(*grid_shape, n,
+    n)`, symmetric positive definite),
+  - a JAX-jittable speed field ~speed_fn(coords) -> speed~ (obstacles are
+    just ~speed_fn(x) ~ 0~ there; anything in between is slow terrain, a
+    soft margin, whatever the caller wants),
 
-Let ~(u1, u2)~ be the robot's own velocity resolved into its own
-forward/lateral frame at heading ~theta~ (~u1~ = forward, ~u2~ = lateral),
-and ~u3~ = turning rate. The cost-per-unit-length of moving in a given
-direction is
+~fsm.Solver~ computes the arrival-time field from one source state to
+every other grid state.
 
-#+begin_src text
-F(theta, u1, u2, u3) = sqrt(u1^2 + u2^2/xi^2 + u3^2/xi^2)
-#+end_src
+** Candidate moves
 
-i.e. speed along a translation direction ~phi~ off the current heading is
-~sqrt(cos(phi)^2 + xi^2 sin(phi)^2)~ (1 when moving straight ahead, ~xi~
-when moving purely sideways), and turning happens at speed ~xi~ as well --
-one shared anisotropy ratio for "everything that isn't pure forward
-translation." This is a *soft* preference (nothing is ever infinitely slow
-or forbidden), unlike a curvature-bounded Dubins/Reeds-Shepp model -- the
-right choice for an omnidirectional legged robot that CAN strafe or turn in
-place, just prefers not to.
+Every integer grid-offset vector within a max ~radius~ of the origin, on
+every axis, excluding the zero vector -- e.g. for a 3-D grid, ~radius=2~
+gives all of ~{-2,...,2}^3 \ {0}~, 124 directions. Every such offset lands
+EXACTLY on a grid-neighbor node (no interpolation needed anywhere), and --
+this is the actual point of using a wide, N-D stencil instead of two
+separate "translate" and "rotate" move families (an earlier version of
+this package's SE(2) solver) -- an offset can be nonzero in MULTIPLE axes
+at once, e.g. simultaneously translating AND rotating in a single
+candidate move. A scheme that only ever offers axis-separated moves cannot
+represent that at all, which is why it could never produce a shortest path
+that actually turns into its direction of travel: any use of rotation
+always paid its full cost immediately, with no way to blend it into
+forward progress (confirmed directly, see ~tests/test_se2.py~'s
+combined-moves test). Larger ~radius~ gives finer angular resolution at
+the cost of ~(2*radius+1)^n~ candidates -- exponential in dimension, so
+keep it modest beyond 2-3 axes.
+
+The cost of taking offset ~o~ from node ~X~ is the metric length of the
+physical displacement, divided by the WORSE (lower) of the speeds at every
+lattice point the move passes through (not just its two endpoints -- a
+wide-radius move can otherwise tunnel straight through a thin,
+sub-radius obstacle without ever landing on it; a real bug this package's
+own tests caught, fixed via ~fsm._segment_lattice_points~, a Bresenham-
+style line rasterization of each offset). A move touching a zero-speed
+node anywhere costs ~inf~, which naturally keeps the value iteration from
+ever finding a cheap path through an obstacle -- no separate masking/
+pinning step needed; ~inf~/~nan~ are clipped back to a finite sentinel
+after every sweep so the returned field stays well-behaved for anything
+downstream that interpolates it.
 
 ** The numerical method
 
 Value iteration (Bellman fixed-point / semi-Lagrangian fast sweeping):
 every grid node's arrival time is repeatedly updated (Jacobi-style, using
-the previous full-grid iterate) as the minimum, over a fixed set of
-candidate local moves, of "move cost + interpolated arrival time at the
-target of that move". Two disjoint candidate-move families, chosen so
-neither one needs a general 3-D interpolation:
-
-  - *Translate*: ~n_directions~ candidate directions ~phi_m~ evenly spaced
-    around the current heading, each a step of one grid cell's physical
-    length within the SAME theta layer (2-D bilinear interpolation against
-    that layer only).
-  - *Rotate*: step to the two theta-adjacent grid layers at the SAME
-    (x, y) (exact grid lookup, periodic wrap in theta -- no interpolation
-    needed at all, theta is already discrete).
-
-Any continuous path is a limit of alternating small translate-only and
-rotate-only hops, so this decoupled candidate set is a legitimate (if not
-maximally sample-efficient) semi-Lagrangian discretization of the full
-coupled metric above. Iterated to convergence (or a fixed iteration budget)
-via a plain Python loop around a JIT-compiled single-sweep step -- see
-~se2.solve~'s docstring for the exact update rule and tunable parameters.
+the previous full-grid iterate) as the minimum, over every candidate
+offset, of "move cost + value at the offset target". Non-periodic axes
+clamp at the boundary (Neumann-like); periodic axes wrap. Iterated to
+convergence (or a fixed iteration budget) via a plain Python loop around a
+JIT-compiled single-sweep step.
 
 ** Usage
 
 #+begin_src python
+import jax.numpy as jnp
 import numpy as np
-from eikonax.se2 import solve
+from eikonax.fsm import Solver
 
-mask = np.zeros((64, 64), dtype=bool)   # True = obstacle
-field = solve(mask, resolution=0.1, n_theta=16, xi=0.4, source=(32, 32, 0))
+grid_shape = (64, 64)
+metric = np.tile(np.eye(2), (*grid_shape, 1, 1))  # isotropic
+
+def speed_fn(coords):
+    x, y = coords[..., 0], coords[..., 1]
+    return jnp.where((x > 3.0) & (x < 3.2), 0.0, 1.0)  # a thin wall
+
+solver = Solver(grid_shape, resolutions=(0.1, 0.1), periodic=(False, False),
+                 metric=metric, speed_fn=speed_fn, radius=3)
+field = solver.solve(source=(32, 5))
+#+end_src
+
+~Solver.solve(source)~ is single-source, by design (mirrors the
+~skfmm.travel_time~ single-source contract) -- a caller wanting an
+all-pairs field builds ONE ~Solver~ (compiling its sweep once) and loops
+over source states, disk-caching the result themselves (as
+~po_goc_mpc.experiments.objectives.fmm.build_all_pairs_fmm_field~ already
+does for its own single-source ~skfmm~ solves, and ~po_goc_mpc.
+experiments.objectives.aniso_fmm~ does for this package's SE(2)
+application).
+
+* ~eikonax.se2~: anisotropic eikonal equation on R^2 x S^1
+
+A thin SE(2)-specific application of ~fsm.py~: builds the grid/
+periodicity/metric-field plumbing ~fsm.Solver~ needs for a "unicycle-ish"
+~(x, y, theta)~ state space, over a `(ny, nx, n_theta)` grid (`x`/`y`
+non-periodic, `theta` periodic).
+
+** The default metric
+
+~default_metric_at_theta(thetas, xi_lateral, xi_turn)~ builds the standard
+"soft preference for moving/turning toward the current heading" model:
+resolving `(dy, dx)` into the robot's own forward/lateral frame at heading
+`theta` as `(u1, u2)`, and `dtheta` as `u3`,
+
+#+begin_src text
+F(theta, dy, dx, dtheta)^2 = u1^2 + u2^2/xi_lateral^2 + dtheta^2/xi_turn^2
+#+end_src
+
+moving along the current heading is unit cost, moving laterally costs
+`1/xi_lateral`, turning costs `1/xi_turn` -- a SEPARATE ratio from lateral
+translation, both in `(0, 1]`. This is a *soft* preference (nothing is
+ever infinitely slow or forbidden), unlike a curvature-bounded Dubins/
+Reeds-Shepp model -- the right choice for an omnidirectional legged robot
+that CAN strafe or turn in place, just prefers not to.
+
+*** Why ~xi_lateral~/~xi_turn~ are decoupled, not one shared ratio
+
+A 90 degree reorientation costs about as much as (or more than) just
+strafing the equivalent lateral distance under one shared ratio -- turning
+needs it TWICE if the path has to turn back afterward -- so a shortest
+path tends to strafe with a near-frozen heading rather than actually turn
+to face its direction of travel, even at a fairly aggressive shared ratio.
+Decoupling lets pure rotation be made cheap (`xi_turn` close to 1)
+independently of how expensive strafing stays (`xi_lateral` small).
+
+** ANY metric matrix can be substituted
+
+~build_solver~'s ~metric_at_theta~ argument accepts a fully custom
+`(n_theta, 3, 3)` array instead of the default diagonal one -- including a
+metric with genuine translation-rotation COUPLING, which the earlier
+version of this package (separate "translate" and "rotate" candidate move
+families, no metric matrix at all) could not express no matter how its
+scalar cost ratios were tuned: no shared-heading query ever benefited from
+turning, since any rotation always paid its full "there and back" cost on
+top of whatever a diagonal zig-zag could already achieve at no heading
+cost. `fsm.py`'s combined-offset candidates remove that structural floor
+(confirmed directly in `tests/test_se2.py`); the metric matrix here just
+decides how strongly a turning preference is expressed once it's actually
+representable.
+
+** Usage
+
+#+begin_src python
+import jax.numpy as jnp
+from eikonax.se2 import build_solver
+
+def free_speed_fn(coords):
+    return jnp.ones(coords.shape[:-1])
+
+solver, thetas = build_solver(
+    ny=64, nx=64, resolution=0.1, n_theta=16, speed_fn=free_speed_fn,
+    xi_lateral=0.4, xi_turn=0.9, radius=2,
+)
+field = solver.solve(source=(32, 32, 0))
 # field.shape == (64, 64, 16); field[i, j, k] = arrival time from the
 # source state to (x[j], y[i], theta[k]).
 #+end_src
 
-~solve~ is single-source, by design (mirrors the ~skfmm.travel_time~
-single-source contract) -- a caller wanting an all-pairs field loops over
-source states and disk-caches the result themselves (as
-~po_goc_mpc.experiments.objectives.fmm.build_all_pairs_fmm_field~ already
-does for its own single-source ~skfmm~ solves); ~solve~ is a plain function
-of numpy/JAX arrays with no opinion on that.
+~mask_speed_fn(mask, resolution)~ bridges a binary occupancy mask (e.g.
+from a pyrobosim ~OccupancyGrid~) into the ~speed_fn~ `fsm.Solver` wants,
+for the common case of a plain binary obstacle layout.

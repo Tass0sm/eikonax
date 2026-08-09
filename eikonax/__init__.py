@@ -1,3 +1,3 @@
-from . import se2
+from . import fsm, se2
 
-__all__ = ["se2"]
+__all__ = ["fsm", "se2"]
