@@ -1,0 +1,93 @@
+#+title: eikonax
+
+JAX-based numerical solvers for eikonal and Hamilton-Jacobi-Bellman (HJB)
+equations on regular grids. An eikonal equation |grad u|_F = 1 (arrival-time
+field for a given, possibly anisotropic, cost metric F) is the stationary,
+shortest-time special case of an HJB equation -- both are solved here the
+same way: value iteration over a discretized control set (a semi-Lagrangian
+scheme), which is simple to get right for a genuinely anisotropic/Finsler
+metric (no local finite-difference stencil to derive per equation) and
+vectorizes cleanly on GPU via JAX.
+
+* Setup
+
+#+begin_src sh
+poetry install
+#+end_src
+
+* ~eikonax.se2~: anisotropic eikonal equation on R^2 x S^1
+
+Solves a single-source arrival-time field over a "unicycle-ish" state space
+~(x, y, theta)~ -- position plus heading -- where the local cost of moving
+in a given world-frame direction depends on how well it's aligned with the
+CURRENT heading ~theta~: moving straight ahead is cheapest/fastest, moving
+sideways or turning in place is slower, controlled by one anisotropy ratio
+~xi in (0, 1]~ (~xi = 1~ recovers the isotropic case). This is the standard
+"faster in the direction you're facing" model used to make routed paths
+around obstacles prefer smooth, forward-facing motion over strafing --
+originally built for ~po-goc-mpc~'s legged-robot obstacle routing (see that
+project's ~po_goc_mpc.experiments.objectives~ for the all-pairs field
+builder + disk cache + ~edge_cost_fn~ wrapper built on top of this solver).
+
+** The metric
+
+Let ~(u1, u2)~ be the robot's own velocity resolved into its own
+forward/lateral frame at heading ~theta~ (~u1~ = forward, ~u2~ = lateral),
+and ~u3~ = turning rate. The cost-per-unit-length of moving in a given
+direction is
+
+#+begin_src text
+F(theta, u1, u2, u3) = sqrt(u1^2 + u2^2/xi^2 + u3^2/xi^2)
+#+end_src
+
+i.e. speed along a translation direction ~phi~ off the current heading is
+~sqrt(cos(phi)^2 + xi^2 sin(phi)^2)~ (1 when moving straight ahead, ~xi~
+when moving purely sideways), and turning happens at speed ~xi~ as well --
+one shared anisotropy ratio for "everything that isn't pure forward
+translation." This is a *soft* preference (nothing is ever infinitely slow
+or forbidden), unlike a curvature-bounded Dubins/Reeds-Shepp model -- the
+right choice for an omnidirectional legged robot that CAN strafe or turn in
+place, just prefers not to.
+
+** The numerical method
+
+Value iteration (Bellman fixed-point / semi-Lagrangian fast sweeping):
+every grid node's arrival time is repeatedly updated (Jacobi-style, using
+the previous full-grid iterate) as the minimum, over a fixed set of
+candidate local moves, of "move cost + interpolated arrival time at the
+target of that move". Two disjoint candidate-move families, chosen so
+neither one needs a general 3-D interpolation:
+
+  - *Translate*: ~n_directions~ candidate directions ~phi_m~ evenly spaced
+    around the current heading, each a step of one grid cell's physical
+    length within the SAME theta layer (2-D bilinear interpolation against
+    that layer only).
+  - *Rotate*: step to the two theta-adjacent grid layers at the SAME
+    (x, y) (exact grid lookup, periodic wrap in theta -- no interpolation
+    needed at all, theta is already discrete).
+
+Any continuous path is a limit of alternating small translate-only and
+rotate-only hops, so this decoupled candidate set is a legitimate (if not
+maximally sample-efficient) semi-Lagrangian discretization of the full
+coupled metric above. Iterated to convergence (or a fixed iteration budget)
+via a plain Python loop around a JIT-compiled single-sweep step -- see
+~se2.solve~'s docstring for the exact update rule and tunable parameters.
+
+** Usage
+
+#+begin_src python
+import numpy as np
+from eikonax.se2 import solve
+
+mask = np.zeros((64, 64), dtype=bool)   # True = obstacle
+field = solve(mask, resolution=0.1, n_theta=16, xi=0.4, source=(32, 32, 0))
+# field.shape == (64, 64, 16); field[i, j, k] = arrival time from the
+# source state to (x[j], y[i], theta[k]).
+#+end_src
+
+~solve~ is single-source, by design (mirrors the ~skfmm.travel_time~
+single-source contract) -- a caller wanting an all-pairs field loops over
+source states and disk-caches the result themselves (as
+~po_goc_mpc.experiments.objectives.fmm.build_all_pairs_fmm_field~ already
+does for its own single-source ~skfmm~ solves); ~solve~ is a plain function
+of numpy/JAX arrays with no opinion on that.

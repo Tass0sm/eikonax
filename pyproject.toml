@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "eikonax"
+version = "0.1.0"
+description = "JAX-based numerical solvers for eikonal and Hamilton-Jacobi-Bellman equations"
+authors = ["Tassos Manganaris <tassos.manganaris@gmail.com>"]
+readme = "README.org"
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.13"
+jax = ">=0.4.30"
+numpy = ">=1.26"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
