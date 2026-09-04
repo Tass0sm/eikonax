@@ -9,6 +9,11 @@ readme = "README.org"
 python = ">=3.12,<3.13"
 jax = ">=0.4.30"
 numpy = ">=1.26"
+optax = ">=0.2"
+tqdm = ">=4.66"
+
+[tool.poetry.scripts]
+eikonax-solve = "eikonax.scripts.solve:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"

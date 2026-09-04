@@ -171,3 +171,184 @@ field = solver.solve(source=(32, 32, 0))
 ~mask_speed_fn(mask, resolution)~ bridges a binary occupancy mask (e.g.
 from a pyrobosim ~OccupancyGrid~) into the ~speed_fn~ `fsm.Solver` wants,
 for the common case of a plain binary obstacle layout.
+
+* ~eikonax.strategies~: one ~solve(domain, ...)~ per method, kwargs -> CLI
+
+Both solvers are exposed as a strategy: a module with a
+~solve(domain, *, <configuration keyword arguments>, progress_fn=None)~
+function whose keyword arguments *are* its configuration. Both take their
+environmental constraints the same way -- a ~domain~ object
+(~eikonax.domains~) carrying the geometry, periodicity, speed field and
+metric.
+
+  - ~strategies.fsm.solve~ -- the grid Fast Sweeping sweep (exact, one
+    solve per source; ~all_pairs=True~ runs the per-source loop).
+  - ~strategies.ntfields.solve~ -- physics-informed training of a
+    continuous all-pairs neural field; ~objective="td_ntfields"~ selects
+    the implementation (see below).
+
+~eikonax.scripts.solve~ builds its CLI by introspecting those signatures
+(~eikonax.config~, ported from ~dynamic-hierarchy~'s ~config_utils.py~), so
+every knob is a flag and ~--strategy ntfields --help~ / ~--strategy fsm
+--help~ show different options:
+
+#+begin_src sh
+python -m eikonax.scripts.solve --strategy fsm --domain se2 --scenario wall \
+    --ny 41 --nx 41 --n-theta 16 --radius 3
+
+python -m eikonax.scripts.solve --strategy ntfields --domain se2 --scenario free \
+    --epochs 2000 --batch-size 1000
+#+end_src
+
+~--scenario~ picks a named obstacle layout (~eikonax.scenarios~: ~free~,
+~wall~, ~gap~) since a ~speed_fn~ callable cannot be passed on a command
+line; Python callers pass their own ~speed_fn~ to the domain constructor.
+
+#+begin_src python
+import jax.numpy as jnp
+from eikonax.domains import se2_domain
+from eikonax.strategies import fsm, ntfields
+
+def free_speed_fn(coords):
+    return jnp.ones(coords.shape[:-1])
+
+domain = se2_domain(free_speed_fn, ny=64, nx=64, resolution=0.1, n_theta=16,
+                    xi_lateral=0.4, xi_turn=0.9)
+
+field = fsm.solve(domain, source=(32, 32, 0), radius=2)   # (64, 64, 16)
+model = ntfields.solve(domain, epochs=2000)               # a trained Model
+#+end_src
+
+* ~eikonax.strategies.ntfields~: neural travel-time fields (TD-NTFields)
+
+A learned, continuous, ALL-PAIRS alternative to the grid sweep.
+~fsm.Solver.solve(source)~ sweeps one grid per source, so an all-pairs
+field costs one sweep per source state (which is why the downstream
+consumer caches them to disk). ~ntfields~ instead fits a single two-point
+network ~T(x0, x1)~ to the same eikonal equation by physics-informed
+training -- no grid, no per-source solve, and differentiable end to end,
+at the price of being approximate.
+
+It is a port of *TD-NTFields* (Ni, Pan & Qureshi, ICLR 2025) from the
+~ntrl-demo~ reference implementation, generalized from "isotropic
+Euclidean speed field" to "arbitrary per-point Riemannian metric plus
+speed field" -- the same generalization ~fsm.py~ makes on the grid side,
+so a ~Domain~ and an ~fsm.Solver~ can be handed the same
+`(metric, speed_fn)` and compared node for node.
+
+Three pieces, following the method/backend split of the ~srms~ project:
+
+  - ~eikonax.domains~ -- the continuous counterpart of ~fsm.Solver~'s
+    `(grid_shape, resolutions, periodic, metric, speed_fn)`: a box with
+    per-axis periodicity, a speed field, and an INVERSE metric (`fsm`
+    measures the length of a finite displacement and wants ~G~; the PDE
+    measures the length of a covector `grad T` and wants ~G^-1~).
+    ~se2_domain~ mirrors ~se2.build_solver~'s conventions exactly, down to
+    the `(y, x, theta)` axis order, and ~domain.fsm_solver()~ hands the
+    SAME domain to the grid side.
+  - ~eikonax.backends~ -- the model design (`metric_net`).
+  - ~eikonax.strategies.ntfields~'s ~objective=~ -- the training objective
+    (`td_ntfields`, the only one so far).
+
+** The backend: a learned quasimetric, not a regression head
+
+`T(x0, x1)` is not read off an output neuron. Both endpoints go through
+one shared, row-wise spectrally-normalized (~1-Lipschitz) encoder `f`, and
+the travel time is a smooth-max distance between the two embeddings:
+
+#+begin_src text
+d = sqrt((f(x0) - f(x1))^2 + eps)          per feature
+T = out_scale * sum_g smoothmax_g(d)       log-sum-exp max over each group of features
+#+end_src
+
+so `T` is symmetric, non-negative, and minimal on the diagonal *by
+construction*: the boundary condition holds for free, for every source, and
+the triangle inequality is approximately structural rather than trained.
+This is what makes the Bellman (TD) loss below well posed, and it is why
+this port keeps the two-point form rather than the fixed-source
+`T = base/tau` factorization that the ~srms~ project's own NTFields ports
+use.
+
+The input is a random-Fourier feature map with a FROZEN matrix `B`. On a
+periodic axis `B`'s row is rounded to integers -- normalized periodic axes
+have period exactly 1 -- so the network is exactly periodic in `theta` by
+construction, not by training.
+
+** The objective
+
+Writing `|p|_x = sqrt(p^T G(x)^-1 p)` for the dual norm of a covector, the
+eikonal equation is `S(x) * |grad T|_x = 1`, and
+
+#+begin_src text
+L = mean[ (w_E*L_E + w_TD*L_TD + w_N*L_N) * exp(-lambda_C * T) ]
+#+end_src
+
+with every term evaluated at BOTH endpoints of every pair:
+
+  - `L_E  = (sqrt(S(x) * |grad_x T|_x) - 1)^2` -- the eikonal residual.
+  - `L_TD = (T - stopgrad[T(x - dx, x') + dt])^2` -- a Bellman backup one
+    characteristic step `dx = td_step * S(x) * G(x)^-1 grad_x T` toward the
+    other endpoint, charged at the ground-truth `dt = td_step / S(x)`, and
+    masked wherever `T < dt` (stepping would overshoot past the target).
+    This finite-scale term is what "TD" names, and it is what carries
+    information further than the infinitesimal `L_E` can.
+  - `L_N  = (1.001 - S(x)) * |S(x) grad_x T + n(x)|_x^2` -- near an
+    obstacle the characteristic must run along the obstacle normal
+    `n = grad S / |grad S|_x` rather than through it. (The reference reads
+    `n` from a precomputed surface-normal dataset; taking it from the speed
+    field's own gradient is what makes this work for any `speed_fn`, and it
+    degenerates harmlessly to a weak regularizer for a hard binary mask,
+    whose gradient is zero.)
+  - `exp(-lambda_C * T)` is the causality curriculum: near pairs are fit
+    first, far pairs only once the near ones are cheap.
+
+Pairs are drawn the way the reference draws them -- `x1 = x0 + unit *
+U(0, pair_radius)`, so short-range pairs are common. Drawing both endpoints
+independently instead concentrates every pair near the domain diameter,
+where the curriculum weight is uniformly tiny and the field never gets
+anchored; this is not a detail.
+
+** Usage
+
+#+begin_src python
+import jax.numpy as jnp
+from eikonax.domains import se2_domain
+from eikonax.strategies import ntfields
+
+def free_speed_fn(coords):
+    return jnp.ones(coords.shape[:-1])
+
+domain = se2_domain(free_speed_fn, ny=64, nx=64, resolution=0.1, n_theta=16,
+                    xi_lateral=0.4, xi_turn=0.9)
+model = ntfields.solve(domain, epochs=2000)   # objective="td_ntfields" by default
+
+model.time(X0, X1)                       # arrival time between physical coordinates
+model.gradient(X0, X1)                   # dT/dx0, dT/dx1 -- descend -dT/dx1 to plan
+field = model.field((3.2, 3.2, 0.0), (64, 64, 16))   # same shape se2.solve returns
+#+end_src
+
+Any custom metric is accepted the same way ~se2.build_solver~ accepts one:
+pass ~metric_inv_fn~ to ~se2_domain~, or build a ~BoxDomain~ directly for a
+non-SE(2) state space.
+
+** Caveats
+
+  - `td_step` is a length in the domain's own METRIC units. The reference's
+    0.03 is ~3% of its unit-span, identity-metric box; scale it with your
+    domain.
+  - ~ntfields.solve~'s keyword defaults are the reference implementation's,
+    including its training loop: an epoch whose loss grew by more than
+    ~rollback_ratio~ is discarded and re-run from a randomly chosen recent
+    checkpoint. That rollback is what lets the objective's `sqrt` and `1/S`
+    terms train at a fixed learning rate.
+  - This is an approximation, and unlike ~fsm~ it has no monotone
+    convergence guarantee. Score it against ~fsm.Solver~ on the same
+    `(metric, speed_fn)` before trusting it downstream. Two measurements
+    on CPU, both well under the reference's 5000x5x2000 budget: a free
+    2-D unit box (1200 epochs x 4 x 1000) reaches 1.3% relative L2 error
+    against exact Euclidean distance with a mean predicted speed of 0.998;
+    a 21x21x8 SE(2) grid with a wall (1500 epochs x 4 x 1000, scored
+    against the ~fsm~ sweep) reaches 15.8% mean relative error at
+    correlation 0.89, with the error concentrated in the expensive tail
+    (predicted max 18.0 against a true 27.3) -- exactly where the
+    `exp(-lambda_C * T)` curriculum gets to last.

@@ -266,6 +266,13 @@ class Solver:
 
         self._sweep = jax.jit(sweep)
 
+    @property
+    def speed_field(self) -> np.ndarray:
+        """The speed at every grid node, `grid_shape` -- evaluated once at
+        construction. `== 0` marks an obstacle node; a caller building an
+        all-pairs field skips those as sources."""
+        return self._speed_field
+
     def solve(self, source, n_iters: int = 300, tol: float = 1e-5) -> np.ndarray:
         """Returns `field`, shape `grid_shape`: `field[idx]` is the arrival
         time from state `source` (grid indices, length `n` -- NOT physical
