@@ -109,6 +109,11 @@ def solve(
         speed_alpha: float = 1.025,
         speed_smoothstep: bool = True,
         min_speed: float = 1e-2,
+        # weak supervision: PRM anchor (roadmap.py), off by default
+        roadmap_weight: float = 0.0,
+        roadmap_nodes: int = 256,
+        roadmap_k: int = 10,
+        roadmap_segment_samples: int = 8,
         # budget
         epochs: int = 5000,
         batches_per_epoch: int = 5,

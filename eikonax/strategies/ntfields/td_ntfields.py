@@ -59,6 +59,20 @@ Deviations from the reference implementation:
     is small, which the reference feeds straight into a `sqrt`.
   - Retries are capped (`cfg.rollback_max_retries`); the reference's
     rollback loop is unbounded.
+
+Weak supervision (optional, `cfg.roadmap_weight > 0`):
+
+  A probabilistic roadmap over the domain (`roadmap.py`) supplies an
+  obstacle-aware approximate geodesic `d_PRM(x0, x1)` for any pair, and
+
+      L += roadmap_weight * mean_valid[ (T(x0, x1) - stopgrad d_PRM)^2 ]
+
+  is added, masked to pairs the roadmap graph can connect. It is NOT under
+  the `exp(-lambda_C T)` curriculum: its point is to anchor the far /
+  around-obstacle pairs the curriculum suppresses, which is exactly where
+  the local eikonal/TD terms cannot reach early in training. `d_PRM` does
+  not depend on the parameters, so it is computed once per batch outside
+  the gradient. `roadmap_weight = 0` (the default) builds nothing.
 """
 
 from __future__ import annotations
@@ -73,6 +87,7 @@ from tqdm import trange
 
 from ...backends import time_and_grads
 from ...domains import DTYPE, dual_norm
+from .roadmap import build_roadmap, roadmap_distance
 
 
 def speed_star(domain, Xn, cfg):
@@ -179,20 +194,35 @@ def solve(domain, cfg, backend, progress_fn=None):
     )
     opt_state = optimizer.init(params)
 
-    def loss_fn(p, X0, X1, beta):
+    use_roadmap = getattr(cfg, "roadmap_weight", 0.0) > 0.0
+    if use_roadmap:
+        roadmap = build_roadmap(
+            domain, n_nodes=cfg.roadmap_nodes, k=cfg.roadmap_k,
+            segment_samples=cfg.roadmap_segment_samples, seed=cfg.seed,
+        )
+        road_dist = jax.jit(lambda a, b: roadmap_distance(roadmap, domain, a, b))
+
+    def loss_fn(p, X0, X1, d_prm, beta):
         eikonal, td, normal, causal = loss_terms(backend, p, X0, X1, domain, cfg)
         weighted = cfg.eikonal_weight * eikonal + cfg.td_weight * td + cfg.normal_weight * normal
         objective = jnp.mean(weighted * causal)
+        roadmap_loss = jnp.float32(0.0)
+        if use_roadmap:
+            valid = jnp.isfinite(d_prm)
+            residual = jnp.where(valid, (backend.travel_time(p, X0, X1, cfg) - d_prm) ** 2, 0.0)
+            roadmap_loss = jnp.sum(residual) / jnp.maximum(jnp.sum(valid), 1.0)
+            objective = objective + cfg.roadmap_weight * roadmap_loss
         return beta * objective, {
             "objective": objective,
             "eikonal": jnp.mean(eikonal),
             "td": jnp.mean(td),
             "normal": jnp.mean(normal),
+            "roadmap": roadmap_loss,
         }
 
     @jax.jit
-    def step(p, state, X0, X1, beta):
-        (_, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, X0, X1, beta)
+    def step(p, state, X0, X1, d_prm, beta):
+        (_, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, X0, X1, d_prm, beta)
         updates, state = optimizer.update(grads, state, p)
         return optax.apply_updates(p, updates), state, aux
 
@@ -206,7 +236,8 @@ def solve(domain, cfg, backend, progress_fn=None):
             metrics = {}
             for _ in range(cfg.batches_per_epoch):
                 X0, X1 = sample_pairs(domain, rng, cfg.batch_size, cfg.pair_radius)
-                trial_params, trial_state, aux = step(trial_params, trial_state, X0, X1, beta)
+                d_prm = road_dist(X0, X1) if use_roadmap else jnp.zeros(X0.shape[0], dtype=DTYPE)
+                trial_params, trial_state, aux = step(trial_params, trial_state, X0, X1, d_prm, beta)
                 metrics = {k: metrics.get(k, 0.0) + float(v) / cfg.batches_per_epoch for k, v in aux.items()}
             current = metrics["objective"]
             grew = previous is not None and not (0.0 < current / max(previous, 1e-12) < cfg.rollback_ratio)

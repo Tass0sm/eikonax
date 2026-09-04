@@ -308,6 +308,33 @@ independently instead concentrates every pair near the domain diameter,
 where the curriculum weight is uniformly tiny and the field never gets
 anchored; this is not a detail.
 
+** Weak supervision: a PRM anchor (~roadmap_weight~)
+
+The curriculum's cost is that far pairs -- and pairs separated by an
+obstacle -- get almost no signal until the near field converges, and the
+local residual only carries information one ~td_step~ at a time. ~srms~'s
+~weak_supervision.py~ fixes the analogous single-source problem by
+factoring ~T = base · exp(g)~ over an RRT* tree; that doesn't transfer
+(fixed quasimetric backend, all-pairs field). A *probabilistic roadmap*
+does: ~ntfields.roadmap.build_roadmap~ samples free nodes once, connects
+each to its ~k~ nearest by a collision-checked, slowness-weighted edge, and
+runs all-pairs shortest paths, giving an obstacle-aware approximate
+geodesic ~d_PRM(x0, x1)~ for *any* pair. With ~roadmap_weight > 0~,
+
+#+begin_src text
+L += roadmap_weight · mean_valid[ (T(x0, x1) − stopgrad d_PRM)² ]
+#+end_src
+
+is added (masked to pairs the graph connects). It is deliberately *outside*
+the ~exp(-lambda_C · T)~ curriculum -- its whole job is to anchor the far /
+around-obstacle pairs the curriculum suppresses. ~roadmap_weight = 0~ (the
+default) builds nothing and is byte-for-byte the plain objective.
+
+#+begin_src python
+model = ntfields.solve(domain, epochs=2000, roadmap_weight=1e-2,
+                       roadmap_nodes=256, roadmap_k=10)
+#+end_src
+
 ** Usage
 
 #+begin_src python

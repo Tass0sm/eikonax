@@ -38,6 +38,8 @@ def test_bool_true_default_becomes_a_no_flag():
     assert "--no-rollback" in flags and "--rollback" not in flags  # default True
     assert "--detach-causal" in flags  # default False
     assert "--epochs" in flags and "--lr" in flags and "--td-step" in flags
+    # weak-supervision knobs come along for free from the signature
+    assert {"--roadmap-weight", "--roadmap-nodes", "--roadmap-k"} <= flags
 
 
 def test_optional_int_resolves_to_int():

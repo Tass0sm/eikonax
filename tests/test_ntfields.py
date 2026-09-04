@@ -3,11 +3,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from eikonax import se2
+from eikonax import scenarios, se2
 from eikonax.backends import metric_net
 from eikonax.domains import BoxDomain, dual_norm, se2_domain, se2_metric_inv_fn
 from eikonax.strategies import ntfields
-from eikonax.strategies.ntfields import td_ntfields
+from eikonax.strategies.ntfields import roadmap, td_ntfields
 
 #: keeps the network and batches tiny -- these are smoke tests, not
 #: convergence claims.
@@ -206,6 +206,73 @@ def test_short_training_run_reduces_the_eikonal_residual():
     assert len(history) == 40
     assert np.mean(history[-5:]) < np.mean(history[:5])
     assert np.all(np.isfinite(model.field((1.0, 1.0), (5, 5))))
+
+
+# -------------------------------------------------------- weak supervision (PRM)
+
+
+def test_roadmap_routes_around_an_obstacle():
+    """A wall between two points must make the roadmap distance exceed the
+    straight-line one; free space must not."""
+    wall = se2_domain(scenarios.wall(wall_x=1.0, wall_y_max=1.8, thickness=0.05),
+                      ny=21, nx=21, resolution=0.1, n_theta=8, xi_lateral=1.0, xi_turn=1.0)
+    free = se2_domain(_free_speed_fn, ny=21, nx=21, resolution=0.1, n_theta=8,
+                      xi_lateral=1.0, xi_turn=1.0)
+    rm_wall = roadmap.build_roadmap(wall, n_nodes=200, k=12, seed=0)
+    rm_free = roadmap.build_roadmap(free, n_nodes=200, k=12, seed=0)
+
+    a = jnp.array([[-0.3, -0.3, 0.0]])  # left of the wall
+    b = jnp.array([[-0.3, 0.3, 0.0]])   # right of the wall, straddling it
+    d_wall = float(roadmap.roadmap_distance(rm_wall, wall, a, b)[0])
+    d_free = float(roadmap.roadmap_distance(rm_free, free, a, b)[0])
+    assert np.isfinite(d_wall) and np.isfinite(d_free)
+    assert d_wall > 1.2 * d_free
+
+
+def test_roadmap_distance_batches_and_tracks_fsm_in_free_space():
+    free = se2_domain(_free_speed_fn, ny=21, nx=21, resolution=0.1, n_theta=8,
+                      xi_lateral=1.0, xi_turn=1.0)
+    rm = roadmap.build_roadmap(free, n_nodes=300, k=12, seed=0)
+    rng = np.random.default_rng(0)
+    X0, X1 = free.sample(rng, 128), free.sample(rng, 128)
+    d = np.asarray(roadmap.roadmap_distance(rm, free, X0, X1))
+    assert d.shape == (128,) and np.all(np.isfinite(d)) and np.all(d >= 0.0)
+
+    # the roadmap distance is a (piecewise) near-upper bound on the true
+    # geodesic, so it should sit around or above the straight-line metric
+    # distance -- not collapse to something far smaller.
+    span = np.asarray(free.span)
+    straight = np.linalg.norm((np.asarray(X0) - np.asarray(X1)) * span, axis=1)
+    assert np.mean(d) >= 0.8 * np.mean(straight)
+
+
+def test_roadmap_can_report_a_disconnected_pair_as_inf():
+    """A wall spanning the whole width splits the domain -- some node pairs
+    are genuinely unreachable through the graph."""
+    full_wall = se2_domain(scenarios.wall(wall_x=1.0, wall_y_max=100.0, thickness=0.5),
+                           ny=21, nx=21, resolution=0.1, n_theta=4)
+    rm = roadmap.build_roadmap(full_wall, n_nodes=200, k=10, segment_samples=16, seed=0)
+    assert not np.all(np.isfinite(np.asarray(rm.node_dist)))
+
+
+def test_training_with_roadmap_weight_runs_and_reports_the_term():
+    domain = se2_domain(scenarios.wall(), ny=15, nx=15, resolution=0.1, n_theta=4)
+    history = []
+    ntfields.solve(
+        domain, progress_fn=lambda e, m: history.append(m),
+        **_SMALL, epochs=6, log_every=1,
+        roadmap_weight=1e-2, roadmap_nodes=80, roadmap_k=8,
+    )
+    assert all("roadmap" in m and np.isfinite(m["roadmap"]) for m in history)
+    assert history[0]["roadmap"] > 0.0
+
+
+def test_roadmap_weight_zero_builds_no_roadmap(monkeypatch):
+    monkeypatch.setattr(td_ntfields, "build_roadmap",
+                        lambda *a, **k: pytest.fail("build_roadmap called with roadmap_weight=0"))
+    history = []
+    _train(_free_box(), progress_fn=lambda e, m: history.append(m), epochs=2, log_every=1)
+    assert all(m["roadmap"] == 0.0 for m in history)
 
 
 def test_model_helpers_round_trip_physical_coordinates():
