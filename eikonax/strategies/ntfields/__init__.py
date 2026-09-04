@@ -113,7 +113,7 @@ def solve(
         roadmap_weight: float = 0.0,
         roadmap_nodes: int = 256,
         roadmap_k: int = 10,
-        roadmap_segment_samples: int = 8,
+        roadmap_segment_samples: int = 16,
         # budget
         epochs: int = 5000,
         batches_per_epoch: int = 5,

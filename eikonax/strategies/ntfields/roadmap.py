@@ -44,6 +44,7 @@ class Roadmap(NamedTuple):
     node_speed: jnp.ndarray   # (M,) domain.speed at each node
     k: int                    # neighbours per node, and per query endpoint
     min_speed: float          # speed floor / obstacle threshold
+    segment_samples: int      # collision-check resolution for the query line-of-sight hop
 
 
 def _wrap_disp(disp, periodic):
@@ -58,7 +59,7 @@ def build_roadmap(
         *,
         n_nodes: int = 256,
         k: int = 10,
-        segment_samples: int = 8,
+        segment_samples: int = 16,
         min_speed: float = 1e-3,
         seed: int = 0,
 ) -> Roadmap:
@@ -98,17 +99,10 @@ def build_roadmap(
     src = np.repeat(np.arange(M), k)
     dst = knn.reshape(-1)
     disp = _wrap_disp(nodes[dst] - nodes[src], periodic)  # (E, dim)
-
-    ts = np.linspace(0.0, 1.0, segment_samples)
-    seg = nodes[src][:, None, :] + ts[None, :, None] * disp[:, None, :]  # (E, S, dim)
-    seg = np.asarray(domain.wrap(jnp.asarray(seg.reshape(-1, dim), dtype=DTYPE)))
-    seg_speed = np.asarray(domain.speed(jnp.asarray(seg, dtype=DTYPE))).reshape(len(src), segment_samples)
-    min_hop_speed = seg_speed.min(axis=1)  # (E,)
-
-    mid = np.asarray(domain.wrap(jnp.asarray(nodes[src] + 0.5 * disp, dtype=DTYPE)))
-    g_hat = np.linalg.inv(np.asarray(domain.metric_inv(jnp.asarray(mid, dtype=DTYPE))))  # (E, dim, dim)
-    length = np.sqrt(np.clip(np.einsum("ei,eij,ej->e", disp, g_hat, disp), 0.0, None))
-    weight = np.where(min_hop_speed > min_speed, length / np.maximum(min_hop_speed, min_speed), np.inf)
+    weight = np.asarray(_hop_cost(
+        domain, jnp.asarray(nodes[src], dtype=DTYPE), jnp.asarray(disp, dtype=DTYPE),
+        segment_samples, min_speed,
+    ))  # (E,)
 
     W = np.full((M, M), np.inf)
     np.minimum.at(W, (src, dst), weight)
@@ -126,15 +120,36 @@ def build_roadmap(
         node_speed=jnp.asarray(node_speed, dtype=DTYPE),
         k=int(k),
         min_speed=float(min_speed),
+        segment_samples=int(segment_samples),
     )
+
+
+def _hop_cost(domain, X0, disp, n_samples, min_speed):
+    """Cost `metric_length(disp) / min_speed_along_hop` of the straight hop
+    `X0 -> X0 + disp` (normalized), `inf` if it grazes an obstacle. `disp`
+    is already periodic-wrapped. Batched over a leading axis."""
+    dim = domain.dim
+    lead = disp.shape[:-1]
+    ts = jnp.linspace(0.0, 1.0, n_samples)
+    seg = domain.wrap((X0[..., None, :] + ts[..., :, None] * disp[..., None, :]).reshape(-1, dim))
+    min_hop_speed = domain.speed(seg).reshape(*lead, n_samples).min(axis=-1)
+    g_hat = jnp.linalg.inv(domain.metric_inv(domain.wrap((X0 + 0.5 * disp).reshape(-1, dim)))).reshape(*lead, dim, dim)
+    length = jnp.sqrt(jnp.clip(jnp.einsum("...i,...ij,...j->...", disp, g_hat, disp), 1e-12, None))
+    return jnp.where(min_hop_speed > min_speed, length / jnp.maximum(min_hop_speed, min_speed), jnp.inf)
 
 
 def roadmap_distance(roadmap: Roadmap, domain, X0, X1) -> jnp.ndarray:
     """Approximate geodesic between batches of normalized points `(B, dim)`,
-    returned `(B,)`: bridge each endpoint to its `k` nearest roadmap nodes
-    (cost `metric_length / speed`), then
-    `min over (a, c) of conn0[a] + node_dist[a, c] + conn1[c]`. `inf`
-    propagates where the graph cannot connect the pair -- the caller masks
+    returned `(B,)`. The smaller of:
+
+      - the **direct** collision-checked straight hop `x0 -> x1` (so a pair
+        that can see each other is not forced through the graph -- this is
+        what keeps free-space `d_PRM` from inflating), and
+      - the **bridged** cost: each endpoint to its `k` nearest roadmap
+        nodes (cost `metric_length / speed`), then
+        `min over (a, c) of conn0[a] + node_dist[a, c] + conn1[c]`.
+
+    `inf` propagates only where neither route exists -- the caller masks
     those.
 
     `roadmap` must be CLOSED OVER, not a jit argument (`roadmap.k` has to be
@@ -144,6 +159,9 @@ def roadmap_distance(roadmap: Roadmap, domain, X0, X1) -> jnp.ndarray:
     node_dist = roadmap.node_dist
     periodic = jnp.asarray(domain.periodic)
     dim = domain.dim
+
+    direct = _hop_cost(domain, X0, _wrap_disp(X1 - X0, periodic),
+                       roadmap.segment_samples, roadmap.min_speed)
 
     def endpoint(X):
         diff = _wrap_disp(X[:, None, :] - nodes[None, :, :], periodic)  # (B, M, dim)
@@ -160,4 +178,4 @@ def roadmap_distance(roadmap: Roadmap, domain, X0, X1) -> jnp.ndarray:
     idx0, conn0 = endpoint(X0)
     idx1, conn1 = endpoint(X1)
     bridged = conn0[:, :, None] + node_dist[idx0[:, :, None], idx1[:, None, :]] + conn1[:, None, :]
-    return jnp.min(bridged.reshape(bridged.shape[0], -1), axis=1)
+    return jnp.minimum(direct, jnp.min(bridged.reshape(bridged.shape[0], -1), axis=1))

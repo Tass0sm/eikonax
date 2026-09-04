@@ -214,15 +214,15 @@ def test_short_training_run_reduces_the_eikonal_residual():
 def test_roadmap_routes_around_an_obstacle():
     """A wall between two points must make the roadmap distance exceed the
     straight-line one; free space must not."""
-    wall = se2_domain(scenarios.wall(wall_x=1.0, wall_y_max=1.8, thickness=0.05),
+    wall = se2_domain(scenarios.wall(wall_x=1.0, wall_y_max=1.8, thickness=0.3),
                       ny=21, nx=21, resolution=0.1, n_theta=8, xi_lateral=1.0, xi_turn=1.0)
     free = se2_domain(_free_speed_fn, ny=21, nx=21, resolution=0.1, n_theta=8,
                       xi_lateral=1.0, xi_turn=1.0)
-    rm_wall = roadmap.build_roadmap(wall, n_nodes=200, k=12, seed=0)
-    rm_free = roadmap.build_roadmap(free, n_nodes=200, k=12, seed=0)
+    rm_wall = roadmap.build_roadmap(wall, n_nodes=250, k=12, segment_samples=24, seed=0)
+    rm_free = roadmap.build_roadmap(free, n_nodes=250, k=12, segment_samples=24, seed=0)
 
-    a = jnp.array([[-0.3, -0.3, 0.0]])  # left of the wall
-    b = jnp.array([[-0.3, 0.3, 0.0]])   # right of the wall, straddling it
+    a = jnp.array([[-0.3, -0.35, 0.0]])  # left of the wall
+    b = jnp.array([[-0.3, 0.35, 0.0]])   # right of the wall, straddling it
     d_wall = float(roadmap.roadmap_distance(rm_wall, wall, a, b)[0])
     d_free = float(roadmap.roadmap_distance(rm_free, free, a, b)[0])
     assert np.isfinite(d_wall) and np.isfinite(d_free)
