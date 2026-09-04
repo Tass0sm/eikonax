@@ -322,7 +322,7 @@ runs all-pairs shortest paths, giving an obstacle-aware approximate
 geodesic ~d_PRM(x0, x1)~ for *any* pair. With ~roadmap_weight > 0~,
 
 #+begin_src text
-L += roadmap_weight · mean_valid[ (T(x0, x1) − stopgrad d_PRM)² ]
+L += roadmap_weight · mean_valid[ (T − stopgrad d_PRM)² ] / mean_valid[ d_PRM² ]
 #+end_src
 
 is added (masked to pairs the graph connects). It is deliberately *outside*

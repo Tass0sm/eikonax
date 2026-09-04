@@ -65,9 +65,12 @@ Weak supervision (optional, `cfg.roadmap_weight > 0`):
   A probabilistic roadmap over the domain (`roadmap.py`) supplies an
   obstacle-aware approximate geodesic `d_PRM(x0, x1)` for any pair, and
 
-      L += roadmap_weight * mean_valid[ (T(x0, x1) - stopgrad d_PRM)^2 ]
+      L += roadmap_weight * mean_valid[ (T - stopgrad d_PRM)^2 ] / mean_valid[ d_PRM^2 ]
 
-  is added, masked to pairs the roadmap graph can connect. It is NOT under
+  is added, masked to pairs the roadmap graph can connect. The
+  `/ mean[d_PRM^2]` normalisation (stop-gradiented) makes the term
+  dimensionless, so `roadmap_weight` lives on the same scale as
+  `eikonal_weight`. It is NOT under
   the `exp(-lambda_C T)` curriculum: its point is to anchor the far /
   around-obstacle pairs the curriculum suppresses, which is exactly where
   the local eikonal/TD terms cannot reach early in training. `d_PRM` does
@@ -209,8 +212,13 @@ def solve(domain, cfg, backend, progress_fn=None):
         roadmap_loss = jnp.float32(0.0)
         if use_roadmap:
             valid = jnp.isfinite(d_prm)
+            n_valid = jnp.maximum(jnp.sum(valid), 1.0)
+            # normalise by the batch's own d_PRM^2 scale so `roadmap_weight`
+            # is dimensionless and comparable to `eikonal_weight` -- an
+            # absolute MSE here is O(diameter^2) and would swamp everything.
+            scale = jax.lax.stop_gradient(jnp.sum(jnp.where(valid, d_prm, 0.0) ** 2) / n_valid) + 1e-6
             residual = jnp.where(valid, (backend.travel_time(p, X0, X1, cfg) - d_prm) ** 2, 0.0)
-            roadmap_loss = jnp.sum(residual) / jnp.maximum(jnp.sum(valid), 1.0)
+            roadmap_loss = jnp.sum(residual) / n_valid / scale
             objective = objective + cfg.roadmap_weight * roadmap_loss
         return beta * objective, {
             "objective": objective,
