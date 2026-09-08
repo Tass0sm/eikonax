@@ -217,7 +217,17 @@ def solve(domain, cfg, backend, progress_fn=None):
             # is dimensionless and comparable to `eikonal_weight` -- an
             # absolute MSE here is O(diameter^2) and would swamp everything.
             scale = jax.lax.stop_gradient(jnp.sum(jnp.where(valid, d_prm, 0.0) ** 2) / n_valid) + 1e-6
-            residual = jnp.where(valid, (backend.travel_time(p, X0, X1, cfg) - d_prm) ** 2, 0.0)
+            # Sanitize d_PRM BEFORE it enters the arithmetic, not just after.
+            # Reverse-mode differentiates both branches of a `where`, so with
+            # an infinite d_PRM the unselected branch contributes
+            # `2 * (T - inf) * dT/dp = -inf`, and multiplying that by the
+            # zero cotangent gives NaN in every parameter. Measured: one
+            # infinite d_PRM in a batch of four NaN-ed all 592,130 params,
+            # and `solve`'s rollback cannot recover because the whole history
+            # is NaN by then. An unreachable pair is common as soon as
+            # `roadmap_distance` reports blocked connections honestly.
+            safe_d_prm = jnp.where(valid, d_prm, 0.0)
+            residual = jnp.where(valid, (backend.travel_time(p, X0, X1, cfg) - safe_d_prm) ** 2, 0.0)
             roadmap_loss = jnp.sum(residual) / n_valid / scale
             objective = objective + cfg.roadmap_weight * roadmap_loss
         return beta * objective, {

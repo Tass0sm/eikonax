@@ -168,11 +168,20 @@ def roadmap_distance(roadmap: Roadmap, domain, X0, X1) -> jnp.ndarray:
         d_norm = jnp.sqrt(jnp.sum(diff ** 2, axis=-1) + 1e-12)
         _, idx = jax.lax.top_k(-d_norm, roadmap.k)  # (B, k) nearest nodes
         sel = jnp.take_along_axis(diff, idx[:, :, None], axis=1)  # (B, k, dim), = X - node
-        mid = domain.wrap((X[:, None, :] - 0.5 * sel).reshape(-1, dim))
-        g_hat = jnp.linalg.inv(domain.metric_inv(mid)).reshape(idx.shape[0], roadmap.k, dim, dim)
-        length = jnp.sqrt(jnp.clip(jnp.einsum("bki,bkij,bkj->bk", sel, g_hat, sel), 1e-12, None))
-        speed = jnp.minimum(roadmap.node_speed[idx], domain.speed(X)[:, None])
-        conn = length / jnp.maximum(speed, roadmap.min_speed)
+        # Collision-check the connection the same way the graph's own edges
+        # are checked. Reading only the speed at the two ends lets an
+        # endpoint join the graph straight THROUGH an obstacle whenever both
+        # ends happen to be free, and the bridged route then inherits that
+        # shortcut -- the same tunnelling hazard `_segment_lattice_points`
+        # guards against on the grid side, and the one `_hop_cost` already
+        # handles for every other edge here. Measured on a multi-room SE(2)
+        # scene: a pair 20.71 apart by exact fast sweeping came back as 6.37,
+        # identically at 48, 192 and 512 `segment_samples`, because this path
+        # never sampled a segment at all.
+        b, k = idx.shape
+        starts = jnp.broadcast_to(X[:, None, :], (b, k, dim)).reshape(-1, dim)
+        conn = _hop_cost(domain, starts, (-sel).reshape(-1, dim),
+                         roadmap.segment_samples, roadmap.min_speed).reshape(b, k)
         return idx, conn
 
     idx0, conn0 = endpoint(X0)
