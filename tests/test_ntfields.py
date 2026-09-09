@@ -292,3 +292,46 @@ def test_model_helpers_round_trip_physical_coordinates():
     field = model.field((0.5, 0.5, 0.0), (11, 11, 4))
     assert field.shape == (11, 11, 4)
     assert field[5, 5, 0] == pytest.approx(float(np.min(field)), abs=1e-3)  # source is the minimum
+
+
+def test_train_ntfield_save_load_round_trips(tmp_path):
+    from eikonax import load_ntfield, train_ntfield
+    from eikonax.strategies.ntfields import ARCHITECTURE_VERSION
+
+    out = tmp_path / "field.npz"
+    obstacles = (np.array([[0.0, 0.0, 0.0]]), np.array([[0.2, 0.2, 0.2]]))
+    model = train_ntfield(
+        coordinate_space="workspace_xyz",
+        normalization_box=((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)),
+        obstacle_boxes=obstacles, margin=0.3, out=out,
+        epochs=15, lr=2e-3, seed=0, **_SMALL,
+    )
+    assert out.exists()
+
+    field = load_ntfield(out)
+    assert field.coordinate_space == "workspace_xyz"
+    assert field.architecture_version == ARCHITECTURE_VERSION
+    assert np.allclose(field.lower, [-1.0, -1.0, -1.0])
+
+    X0 = np.array([[-0.5, -0.5, -0.5], [0.4, 0.1, 0.2]])
+    X1 = np.array([[0.5, 0.5, 0.5], [-0.3, 0.0, 0.1]])
+    assert np.allclose(np.asarray(model.time(X0, X1)),
+                       np.asarray(field.time(X0, X1)), atol=1e-5)
+
+    # The eval primitive stays traceable.
+    jitted = jax.jit(field.travel_time)
+    assert np.allclose(np.asarray(jitted(X0, X1)), np.asarray(field.time(X0, X1)), atol=1e-5)
+
+    # T(x, x) is the smooth-max floor, not fit.
+    floor = 0.2 * (_SMALL["hidden"] // _SMALL["group"]) * np.sqrt(1e-6)
+    assert float(np.asarray(field.time(X0[:1], X0[:1]))[0]) == pytest.approx(floor, abs=1e-4)
+
+
+def test_train_ntfield_non_workspace_space_needs_explicit_fk():
+    from eikonax import train_ntfield
+
+    with pytest.raises(ValueError, match="needs an explicit fk"):
+        train_ntfield(
+            coordinate_space="cspace_ur5", normalization_box=((0.0,), (1.0,)),
+            obstacle_boxes=(np.zeros((1, 3)), np.ones((1, 3))), margin=0.1,
+        )
