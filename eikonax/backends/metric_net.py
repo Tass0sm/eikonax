@@ -107,7 +107,7 @@ def init(key, domain, cfg) -> Params:
         raise ValueError(f"hidden ({cfg.hidden}) must be divisible by group ({cfg.group})")
 
     keys = jax.random.split(key, 4 + 3 * cfg.n_blocks)
-    B = _trunc_normal(keys[0], (domain.dim, n_freq), 1.0)
+    B = _trunc_normal(keys[0], (domain.dim, n_freq), getattr(cfg, "fourier_std", 1.0))
     periodic = jnp.asarray(domain.periodic)[:, None]
     B = jnp.where(periodic, jnp.round(B), B)
 

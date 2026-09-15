@@ -140,6 +140,10 @@ def solve(
         out_scale: float = 0.2,
         lse_scale: float = 10.0,
         softplus_beta: float = 10.0,
+        # frozen (untrained) random Fourier feature matrix B's std -- the
+        # reference uses 0.2 (model_train_metric.py: `0.2*torch.normal(0,1,
+        # ...)`), 5x narrower than this default; see metric_net.init.
+        fourier_std: float = 1.0,
         # objective (strategies/ntfields/td_ntfields.py)
         eikonal_weight: float = 1e-2,
         td_weight: float = 1e-3,
@@ -148,6 +152,8 @@ def solve(
         detach_causal: bool = False,
         td_step: float = 0.03,
         pair_radius: float | None = None,
+        surface_bias_frac: float = 0.0,
+        surface_oversample: int = 4,
         speed_alpha: float = 1.025,
         speed_smoothstep: bool = True,
         min_speed: float = 1e-2,

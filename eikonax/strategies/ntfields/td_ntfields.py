@@ -43,8 +43,12 @@ Deviations from the reference implementation:
 
   - Collocation pairs are resampled every batch instead of being drawn from
     a precomputed dataset, and the reference's restriction of `x0` to a thin
-    band around the obstacle SURFACE is dropped -- there is no mesh here,
-    only a `speed_fn`. Its pair GEOMETRY is kept, and matters: `x1 = x0 +
+    band around the obstacle SURFACE is dropped BY DEFAULT -- there is no
+    mesh here, only a `speed_fn`, so `cfg.surface_bias_frac` (default `0.0`)
+    re-adds it generically, as "the lowest-`speed_star` fraction of an
+    oversampled pool" rather than "within `margin` of a mesh" (see
+    `sample_pairs`'s own doc comment). Its pair GEOMETRY is kept, and
+    matters: `x1 = x0 +
     unit * U(0, pair_radius)` makes short-range pairs common, which is what
     the `exp(-lambda_C * T)` curriculum needs to have anything to bite on
     (drawing both endpoints independently concentrates every pair near the
@@ -103,7 +107,7 @@ def speed_star(domain, Xn, cfg):
     return jnp.clip(s, cfg.min_speed, None)
 
 
-def sample_pairs(domain, rng: np.random.Generator, n: int, radius: float | None = None, max_tries: int = 20):
+def _sample_pairs_uniform(domain, rng: np.random.Generator, n: int, radius: float | None = None, max_tries: int = 20):
     """The reference's pair sampler: `x0` uniform over the domain, `x1 =
     x0 + unit_direction * U(0, radius)` with `radius = sqrt(dim)` in
     normalized units by default. Periodic axes wrap; on non-periodic axes
@@ -134,6 +138,54 @@ def sample_pairs(domain, rng: np.random.Generator, n: int, radius: float | None 
         idx = rng.integers(0, len(X0), n)
         X0, X1 = X0[idx], X1[idx]
     return jnp.asarray(X0, dtype=DTYPE), jnp.asarray(X1, dtype=DTYPE)
+
+
+def sample_pairs(domain, rng: np.random.Generator, n: int, radius: float | None = None,
+                  cfg=None, max_tries: int = 20):
+    """`_sample_pairs_uniform`, optionally biasing a fraction of `x0` toward
+    an obstacle the way the reference's mesh-surface-banded dataset does
+    (`model_function_metric.py`'s `where_d = (0 < obs_distance) & (obs_distance
+    < margin)`, `dataprocessing/speed_sampling_arm_normal.py`) -- generalized
+    from "near the mesh surface" to "where `domain.speed` is smallest", since
+    there is no mesh here, only a `speed_fn` (this module's own prior
+    reasoning for dropping that restriction entirely, see module docstring
+    -- `surface_bias_frac` re-adds it, generically, opt-in).
+
+    `cfg.surface_bias_frac` (default `0.0`, `cfg=None` also counts as `0.0`)
+    is the fraction of `x0` drawn this way; the reference's own dataset is
+    effectively `1.0` (`x0` is ONLY the surface band -- the far-field pairs
+    it still trains on come from wherever the perturbed `x1` happens to
+    land). `0.0` calls `_sample_pairs_uniform` directly and is BYTE-IDENTICAL
+    to this function's behavior before `surface_bias_frac` existed -- every
+    caller that doesn't pass `cfg` (or passes one without the attribute)
+    gets that path.
+
+    Implementation: oversample `cfg.surface_oversample`x (default 4) as many
+    VALID uniform pairs as needed via `_sample_pairs_uniform` itself (so the
+    existing accept/reject-against-the-box logic is reused unchanged, not
+    duplicated), then keep the `n_surface` pairs whose `x0` has the lowest
+    `speed_star` (nearest an obstacle) plus `n - n_surface` more drawn at
+    random from the rest -- a post-hoc SELECTION over already-valid pairs,
+    not a rejection loop of its own, so it can't inherit that loop's
+    thin-domain pathology."""
+    surface_frac = float(getattr(cfg, "surface_bias_frac", 0.0)) if cfg is not None else 0.0
+    if surface_frac <= 0.0:
+        return _sample_pairs_uniform(domain, rng, n, radius, max_tries)
+
+    n_surface = int(round(n * surface_frac))
+    oversample = int(getattr(cfg, "surface_oversample", 4))
+    pool_n = max(n, n_surface * oversample)
+    X0_pool, X1_pool = _sample_pairs_uniform(domain, rng, pool_n, radius, max_tries)
+
+    speeds = np.asarray(speed_star(domain, X0_pool, cfg))
+    order = np.argsort(speeds)  # ascending: nearest-to-obstacle (lowest speed) first
+    surface_idx = order[:n_surface]
+    rest = order[n_surface:]
+    n_uniform = n - n_surface
+    uniform_idx = rng.choice(rest, size=n_uniform, replace=len(rest) < n_uniform) if n_uniform else \
+        np.empty((0,), dtype=int)
+    idx = np.concatenate([surface_idx, uniform_idx])
+    return X0_pool[idx], X1_pool[idx]
 
 
 def speed_normal(domain, Xn, metric_inv, cfg):
@@ -253,7 +305,7 @@ def solve(domain, cfg, backend, progress_fn=None):
             trial_params, trial_state = params, opt_state
             metrics = {}
             for _ in range(cfg.batches_per_epoch):
-                X0, X1 = sample_pairs(domain, rng, cfg.batch_size, cfg.pair_radius)
+                X0, X1 = sample_pairs(domain, rng, cfg.batch_size, cfg.pair_radius, cfg=cfg)
                 d_prm = road_dist(X0, X1) if use_roadmap else jnp.zeros(X0.shape[0], dtype=DTYPE)
                 trial_params, trial_state, aux = step(trial_params, trial_state, X0, X1, d_prm, beta)
                 metrics = {k: metrics.get(k, 0.0) + float(v) / cfg.batches_per_epoch for k, v in aux.items()}
