@@ -31,6 +31,9 @@ def _save(strategy: str, result, domain, out: str) -> None:
     if strategy == "fsm":
         np.savez(out, field=np.asarray(result))
         return
+    if strategy == "wavefront":
+        np.savez(out, field=result.grid_field())
+        return
     # ntfields: `result` is a Model -- evaluate it on the domain's grid from
     # the centre source so the output is directly comparable to an fsm field.
     grid_shape = domain.grid_shape

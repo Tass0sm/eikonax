@@ -50,9 +50,25 @@ def gap(wall_x: float = 2.0, gap_center: float = 2.0, gap_width: float = 0.6,
     return speed_fn
 
 
+def slow(center_y: float = 2.0, center_x: float = 2.0, radius: float = 0.5,
+         depth: float = 0.7) -> Callable:
+    """A smooth slow patch: `speed = 1 - depth * exp(-r^2 / (2 radius^2))`,
+    `r` the distance to `(center_y, center_x)` over the first two axes (a
+    1-D domain's single axis plays the role of `y`). No obstacle -- the
+    speed bottoms out at `1 - depth`."""
+    centre = jnp.asarray([center_y, center_x])
+
+    def speed_fn(coords):
+        k = min(coords.shape[-1], 2)
+        r2 = jnp.sum((coords[..., :k] - centre[:k]) ** 2, axis=-1)
+        return 1.0 - depth * jnp.exp(-r2 / (2.0 * radius ** 2))
+    return speed_fn
+
+
 #: `--scenario` name -> speed-field factory.
 SCENARIOS: dict[str, Callable[..., Callable]] = {
     "free": free,
     "wall": wall,
     "gap": gap,
+    "slow": slow,
 }

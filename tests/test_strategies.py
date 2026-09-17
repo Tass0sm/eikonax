@@ -9,7 +9,7 @@ from eikonax import se2
 from eikonax.domains import se2_domain
 from eikonax.scenarios import SCENARIOS
 from eikonax.scripts import solve as solve_cli
-from eikonax.strategies import STRATEGIES, fsm, ntfields
+from eikonax.strategies import STRATEGIES, fsm, ntfields, wavefront
 
 
 def _free_speed_fn(coords):
@@ -17,8 +17,9 @@ def _free_speed_fn(coords):
 
 
 def test_registry():
-    assert set(STRATEGIES) == {"fsm", "ntfields"}
+    assert set(STRATEGIES) == {"fsm", "ntfields", "wavefront"}
     assert STRATEGIES["fsm"] is fsm and STRATEGIES["ntfields"] is ntfields
+    assert STRATEGIES["wavefront"] is wavefront
 
 
 def test_fsm_solve_matches_se2_solve_node_for_node():

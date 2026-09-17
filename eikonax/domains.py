@@ -256,6 +256,17 @@ def se2_domain(
                      grid_shape=(ny, nx, n_theta))
 
 
+def line_domain(
+        speed_fn: Callable[[jnp.ndarray], jnp.ndarray],
+        n: int = 201,
+        resolution: float = 0.025,
+        origin: float = 0.0,
+) -> BoxDomain:
+    """A bounded 1-D segment of `n` nodes at `resolution` starting at
+    `origin`, isotropic. `speed_fn` reads `coords[..., 0]`."""
+    return BoxDomain((origin,), (origin + (n - 1) * resolution,), (False,), speed_fn, grid_shape=(n,))
+
+
 #: Named domain constructors the CLI can pick with `--domain`. Each takes a
 #: `speed_fn` plus configuration keyword arguments (exposed as flags).
-DOMAINS = {"se2": se2_domain}
+DOMAINS = {"se2": se2_domain, "line": line_domain}

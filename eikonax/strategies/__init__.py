@@ -13,10 +13,12 @@ and metric.
   - `ntfields` -- physics-informed training of a continuous all-pairs
     neural travel-time field; its `objective=` kwarg selects the
     implementation (`td_ntfields`).
+  - `wavefront` -- a single-source field as a partition of unity over
+    local travel-time models chained out from the source (1-D for now).
 """
 
-from . import fsm, ntfields
+from . import fsm, ntfields, wavefront
 
-STRATEGIES = {"fsm": fsm, "ntfields": ntfields}
+STRATEGIES = {"fsm": fsm, "ntfields": ntfields, "wavefront": wavefront}
 
-__all__ = ["STRATEGIES", "fsm", "ntfields"]
+__all__ = ["STRATEGIES", "fsm", "ntfields", "wavefront"]
