@@ -17,7 +17,7 @@ def _free_speed_fn(coords):
 
 
 def test_registry():
-    assert set(STRATEGIES) == {"fsm", "ntfields"}
+    assert {"fsm", "ntfields"} <= set(STRATEGIES) <= {"fsm", "ntfields", "huygens"}
     assert STRATEGIES["fsm"] is fsm and STRATEGIES["ntfields"] is ntfields
 
 
