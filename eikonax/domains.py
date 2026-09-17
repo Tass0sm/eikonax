@@ -256,6 +256,24 @@ def se2_domain(
                      grid_shape=(ny, nx, n_theta))
 
 
+def plane_domain(
+        speed_fn: Callable[[jnp.ndarray], jnp.ndarray],
+        ny: int = 41,
+        nx: int = 41,
+        resolution: float = 0.1,
+        origin_x: float = 0.0,
+        origin_y: float = 0.0,
+        metric_inv_fn: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
+) -> BoxDomain:
+    """The 2-D `(y, x)` counterpart of `se2_domain`: the same bounded
+    `(ny, nx)` grid at `resolution`, no heading axis, isotropic unless
+    `metric_inv_fn` is given. `eikonax.scenarios` speed fields apply as-is
+    (they read only `coords[..., 0]` and `[..., 1]`)."""
+    lower = (origin_y, origin_x)
+    upper = (origin_y + (ny - 1) * resolution, origin_x + (nx - 1) * resolution)
+    return BoxDomain(lower, upper, (False, False), speed_fn, metric_inv_fn, grid_shape=(ny, nx))
+
+
 #: Named domain constructors the CLI can pick with `--domain`. Each takes a
 #: `speed_fn` plus configuration keyword arguments (exposed as flags).
-DOMAINS = {"se2": se2_domain}
+DOMAINS = {"se2": se2_domain, "plane": plane_domain}
