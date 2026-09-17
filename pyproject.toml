@@ -1,23 +1,35 @@
-[tool.poetry]
+[project]
 name = "eikonax"
 version = "0.1.0"
 description = "JAX-based numerical solvers for eikonal and Hamilton-Jacobi-Bellman equations"
-authors = ["Tassos Manganaris <tassos.manganaris@gmail.com>"]
-readme = "README.org"
+authors = [{ name = "Tassos Manganaris", email = "tassos.manganaris@gmail.com" }]
+readme = { file = "README.org", content-type = "text/plain" }
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "jax>=0.4.30",
+    "numpy>=1.26",
+    "optax>=0.2",
+    "tqdm>=4.66",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.12,<3.13"
-jax = ">=0.4.30"
-numpy = ">=1.26"
-optax = ">=0.2"
-tqdm = ">=4.66"
+[project.optional-dependencies]
+# CUDA JAX: `uv sync --extra gpu` (Linux only).
+gpu = ["jax[cuda12]>=0.4.30; sys_platform == 'linux'"]
+# The generic splat regression model the `huygens` strategy is built on.
+splats = ["srms"]
 
-[tool.poetry.scripts]
+[project.scripts]
 eikonax-solve = "eikonax.scripts.solve:main"
 
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.0"
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.uv.sources]
+srms = { path = "../../research/17-subriemannian-ntfields/splat-regression-modeling", editable = true }
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["eikonax"]
