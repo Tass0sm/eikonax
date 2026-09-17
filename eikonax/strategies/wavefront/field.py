@@ -157,3 +157,15 @@ class WavefrontField:
 
     def num_splats(self, params) -> int:
         return int(params["B"].shape[0]) + 1
+
+    # -- what `Model` needs (this model works in NORMALIZED coordinates) -------
+
+    def to_internal(self, X):
+        return self.domain.wrap(self.domain.to_normalized(jnp.asarray(X, dtype=DTYPE)))
+
+    def gradient_scale(self):
+        return 1.0 / jnp.asarray(self.domain.span, dtype=DTYPE)
+
+    def coverage(self, params, X):
+        """`sum_j w_j` at internal points, `(n,)`."""
+        return jax.vmap(lambda x: jnp.sum(self.locals_and_windows(params, x)[1]))(X)

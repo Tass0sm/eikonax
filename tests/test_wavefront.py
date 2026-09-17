@@ -9,7 +9,7 @@ from eikonax.domains import BoxDomain, line_domain
 from eikonax.scenarios import SCENARIOS
 from eikonax.scripts import solve as solve_cli
 from eikonax.strategies import wavefront
-from eikonax.strategies.wavefront import baselines, train
+from eikonax.strategies.wavefront import baselines, chain, train
 
 
 def _slow_domain():
@@ -109,10 +109,13 @@ def test_value_temperature_blend_is_finite_and_close():
 
 
 def test_chain_is_1d_only():
+    """`solve` sends 2-D and up to `grow` (cone splats); the ridge-to-ridge
+    chain itself is 1-D."""
     domain = BoxDomain((0.0, 0.0), (1.0, 1.0), (False, False),
                        lambda c: jnp.ones(c.shape[:-1]), grid_shape=(5, 5))
+    field = wavefront.WavefrontField(domain, np.zeros(2), wavefront.make_config())
     with pytest.raises(NotImplementedError):
-        wavefront.solve(domain)
+        chain.chain_1d(field)
 
 
 def test_cli_wavefront_writes_a_line_field(tmp_path):

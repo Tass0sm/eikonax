@@ -53,6 +53,59 @@ def pu0_fit(field, params, Xn, T_true):
     return pi @ V
 
 
+def blocked(P, Q, rects, tol: float = 1e-9):
+    """Does each segment `P[i] -> Q[i]` cross a `(y0, y1, x0, x1)` rectangle's
+    interior? `(m, 2)`, `(m, 2)` in, `(m,)` bool out (Liang-Barsky)."""
+    P, Q = np.asarray(P, float), np.asarray(Q, float)
+    d = Q - P
+    out = np.zeros(len(P), dtype=bool)
+    for y0, y1, x0, x1 in rects:
+        t0, t1 = np.zeros(len(P)), np.ones(len(P))
+        inside = np.ones(len(P), dtype=bool)
+        for pk, qk in ((-d[:, 0], P[:, 0] - y0 - tol), (d[:, 0], y1 - tol - P[:, 0]),
+                       (-d[:, 1], P[:, 1] - x0 - tol), (d[:, 1], x1 - tol - P[:, 1])):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t = np.where(pk != 0, qk / np.where(pk != 0, pk, 1.0), 0.0)
+            inside &= (pk != 0) | (qk >= 0)
+            t0 = np.where(pk < 0, np.maximum(t0, t), t0)
+            t1 = np.where(pk > 0, np.minimum(t1, t), t1)
+        out |= inside & (t0 < t1)
+    return out
+
+
+def exact_rects(rects, source, pts):
+    """Exact unit-speed arrival time around `(y0, y1, x0, x1)` rectangles:
+    Dijkstra over the source and the rectangles' corners, then a straight
+    shot to each point. `inf` where a point is unreachable (inside a wall).
+
+    The reference for the obstacle scenes -- `fsm`'s own wide-stencil error
+    (~1.4e-2 RMS on these grids) is larger than the field's.
+    """
+    source = np.asarray(source, float)
+    nodes = np.array([source] + [(y, x) for y0, y1, x0, x1 in rects
+                                 for y in (y0, y1) for x in (x0, x1)])
+    n = len(nodes)
+    seg = np.repeat(nodes, n, axis=0), np.tile(nodes, (n, 1))
+    free = (~blocked(*seg, rects)).reshape(n, n)
+    step = np.where(free, np.linalg.norm(nodes[:, None] - nodes[None], axis=-1), np.inf)
+
+    dist = np.full(n, np.inf)
+    dist[0] = 0.0
+    todo = np.ones(n, dtype=bool)
+    for _ in range(n):
+        i = int(np.argmin(np.where(todo, dist, np.inf)))
+        if not todo[i] or not np.isfinite(dist[i]):
+            break
+        todo[i] = False
+        dist = np.minimum(dist, dist[i] + step[i])
+
+    pts = np.asarray(pts, float)
+    m = len(pts)
+    visible = ~blocked(np.repeat(nodes, m, axis=0), np.tile(pts, (n, 1)), rects).reshape(n, m)
+    reach = np.where(visible, dist[:, None] + np.linalg.norm(pts[None] - nodes[:, None], axis=-1), np.inf)
+    return reach.min(axis=0)
+
+
 def pu0_uniform_fit(Xn, T_true, k: int, overlap: float = 0.75):
     """Degree-0 normalized SRM with `k` EVENLY spaced windows over the box,
     oracle-fitted -- how many scalar splats the same accuracy costs."""
@@ -73,4 +126,4 @@ def ridge_fit(field, params, Xn, T_true):
     return atoms @ V
 
 
-__all__ = ["exact_1d", "pu0_fit", "pu0_uniform_fit", "ridge_fit"]
+__all__ = ["blocked", "exact_1d", "exact_rects", "pu0_fit", "pu0_uniform_fit", "ridge_fit"]

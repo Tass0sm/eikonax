@@ -109,6 +109,25 @@ class BoxDomain:
         self._span_j = jnp.asarray(self.span, dtype=DTYPE)
         self._periodic_j = jnp.asarray(self.periodic)
 
+    @property
+    def speed_fn(self) -> Callable:
+        """The speed field over PHYSICAL coordinates, as handed in."""
+        return self._speed_fn
+
+    @property
+    def clearance_fn(self) -> Callable | None:
+        """`coords -> distance to the nearest obstacle` (physical), if the
+        speed field carries one (`eikonax.scenarios` attaches it). `None`
+        means nothing describes the obstacles as distances -- a solver that
+        needs one (`strategies.wavefront` in 2-D) has to say so."""
+        return getattr(self._speed_fn, "clearance", None)
+
+    @property
+    def obstacle_rects(self):
+        """The speed field's obstacles as `(y0, y1, x0, x1)` rectangles, if
+        it carries them (`eikonax.scenarios`); `None` otherwise."""
+        return getattr(self._speed_fn, "rects", None)
+
     def to_normalized(self, X):
         """Physical -> `[-0.5, 0.5]^dim`."""
         return (jnp.asarray(X, dtype=DTYPE) - self._lower_j) / self._span_j - 0.5
@@ -256,6 +275,24 @@ def se2_domain(
                      grid_shape=(ny, nx, n_theta))
 
 
+def plane_domain(
+        speed_fn: Callable[[jnp.ndarray], jnp.ndarray],
+        ny: int = 41,
+        nx: int = 41,
+        resolution: float = 0.1,
+        origin_x: float = 0.0,
+        origin_y: float = 0.0,
+        metric_inv_fn: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
+) -> BoxDomain:
+    """The 2-D `(y, x)` counterpart of `se2_domain`: the same bounded
+    `(ny, nx)` grid at `resolution`, no heading axis, isotropic unless
+    `metric_inv_fn` is given. `eikonax.scenarios` speed fields apply as-is
+    (they read only `coords[..., 0]` and `[..., 1]`)."""
+    lower = (origin_y, origin_x)
+    upper = (origin_y + (ny - 1) * resolution, origin_x + (nx - 1) * resolution)
+    return BoxDomain(lower, upper, (False, False), speed_fn, metric_inv_fn, grid_shape=(ny, nx))
+
+
 def line_domain(
         speed_fn: Callable[[jnp.ndarray], jnp.ndarray],
         n: int = 201,
@@ -269,4 +306,4 @@ def line_domain(
 
 #: Named domain constructors the CLI can pick with `--domain`. Each takes a
 #: `speed_fn` plus configuration keyword arguments (exposed as flags).
-DOMAINS = {"se2": se2_domain, "line": line_domain}
+DOMAINS = {"se2": se2_domain, "plane": plane_domain, "line": line_domain}
