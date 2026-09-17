@@ -16,19 +16,12 @@ and metric.
   - `huygens` -- a single-source field as a min over ray wavelets grown
     from the source (an `srms` splat regression model). Only registered
     when `srms` is installed (the `splats` extra).
+  - `wavefront` -- a single-source field as a partition of unity over
+    local travel-time models chained out from the source (1-D for now).
 """
 
-from . import fsm, ntfields
+from . import fsm, huygens, ntfields, wavefront
 
-STRATEGIES = {"fsm": fsm, "ntfields": ntfields}
+STRATEGIES = {"fsm": fsm, "huygens": huygens, "ntfields": ntfields, "wavefront": wavefront}
 
-try:
-    from . import huygens
-except ImportError as exc:  # `srms` missing: the `splats` extra is not installed
-    if exc.name is None or not exc.name.startswith("srms"):
-        raise
-    huygens = None
-else:
-    STRATEGIES["huygens"] = huygens
-
-__all__ = ["STRATEGIES", "fsm", "huygens", "ntfields"]
+__all__ = ["STRATEGIES", "fsm", "huygens", "ntfields", "wavefront"]

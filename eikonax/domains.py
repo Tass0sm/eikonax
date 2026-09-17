@@ -109,6 +109,25 @@ class BoxDomain:
         self._span_j = jnp.asarray(self.span, dtype=DTYPE)
         self._periodic_j = jnp.asarray(self.periodic)
 
+    @property
+    def speed_fn(self) -> Callable:
+        """The speed field over PHYSICAL coordinates, as handed in."""
+        return self._speed_fn
+
+    @property
+    def clearance_fn(self) -> Callable | None:
+        """`coords -> distance to the nearest obstacle` (physical), if the
+        speed field carries one (`eikonax.scenarios` attaches it). `None`
+        means nothing describes the obstacles as distances -- a solver that
+        needs one (`strategies.wavefront` in 2-D) has to say so."""
+        return getattr(self._speed_fn, "clearance", None)
+
+    @property
+    def obstacle_rects(self):
+        """The speed field's obstacles as `(y0, y1, x0, x1)` rectangles, if
+        it carries them (`eikonax.scenarios`); `None` otherwise."""
+        return getattr(self._speed_fn, "rects", None)
+
     def to_normalized(self, X):
         """Physical -> `[-0.5, 0.5]^dim`."""
         return (jnp.asarray(X, dtype=DTYPE) - self._lower_j) / self._span_j - 0.5
@@ -274,6 +293,17 @@ def plane_domain(
     return BoxDomain(lower, upper, (False, False), speed_fn, metric_inv_fn, grid_shape=(ny, nx))
 
 
+def line_domain(
+        speed_fn: Callable[[jnp.ndarray], jnp.ndarray],
+        n: int = 201,
+        resolution: float = 0.025,
+        origin: float = 0.0,
+) -> BoxDomain:
+    """A bounded 1-D segment of `n` nodes at `resolution` starting at
+    `origin`, isotropic. `speed_fn` reads `coords[..., 0]`."""
+    return BoxDomain((origin,), (origin + (n - 1) * resolution,), (False,), speed_fn, grid_shape=(n,))
+
+
 #: Named domain constructors the CLI can pick with `--domain`. Each takes a
 #: `speed_fn` plus configuration keyword arguments (exposed as flags).
-DOMAINS = {"se2": se2_domain, "plane": plane_domain}
+DOMAINS = {"se2": se2_domain, "plane": plane_domain, "line": line_domain}

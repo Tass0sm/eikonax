@@ -40,6 +40,8 @@ def _save(strategy: str, result, domain, out: str) -> None:
         V, _, B = result.params
         np.savez(out, field=result.grid_field(), wavelet_times=np.asarray(V[:, 0]),
                  wavelet_centres=np.asarray(domain.from_normalized(B)), source=result.source)
+    if strategy == "wavefront":
+        np.savez(out, field=result.grid_field())
         return
     # ntfields: `result` is a Model -- evaluate it on the domain's grid from
     # the centre source so the output is directly comparable to an fsm field.
