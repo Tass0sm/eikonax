@@ -9,14 +9,14 @@ dependencies = [
     "jax>=0.4.30",
     "numpy>=1.26",
     "optax>=0.2",
+    # The generic splat regression model the `huygens` strategy is built on.
+    "srms",
     "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
 # CUDA JAX: `uv sync --extra gpu` (Linux only).
 gpu = ["jax[cuda12]>=0.4.30; sys_platform == 'linux'"]
-# The generic splat regression model the `huygens` strategy is built on.
-splats = ["srms"]
 
 [project.scripts]
 eikonax-solve = "eikonax.scripts.solve:main"

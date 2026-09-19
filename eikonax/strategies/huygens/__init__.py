@@ -11,8 +11,6 @@ re-emit into shadows.
 `solve(domain, *, source, <kwargs>) -> Model`, the same call shape as
 `strategies.fsm` (`source` is a grid index into `domain.grid_shape`) so the
 two fields are directly comparable node for node.
-
-Needs `srms` (the `splats` extra).
 """
 
 from __future__ import annotations

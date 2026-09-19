@@ -13,12 +13,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-pytest.importorskip("srms")
-
-from eikonax.domains import plane_domain  # noqa: E402
-from eikonax.scenarios import SCENARIOS  # noqa: E402
-from eikonax.scripts import solve as solve_cli  # noqa: E402
-from eikonax.strategies import STRATEGIES, huygens  # noqa: E402
+from eikonax.domains import plane_domain
+from eikonax.scenarios import SCENARIOS
+from eikonax.scripts import solve as solve_cli
+from eikonax.strategies import STRATEGIES, huygens
 
 SOURCE_IDX = (20, 5)
 SOURCE = np.array([2.0, 0.5])
